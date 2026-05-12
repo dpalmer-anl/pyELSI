@@ -35,9 +35,9 @@ docs = ["mkdocs>=1.6", "mkdocs-material>=9.5", "mkdocstrings[python]>=0.25", "mi
 mpi = ["mpi4py>=3.1"]
 
 [project.urls]
-Homepage = "https://github.com/GITHUB_USERNAME/pyELSI"
-Repository = "https://github.com/GITHUB_USERNAME/pyELSI"
-"Bug Tracker" = "https://github.com/GITHUB_USERNAME/pyELSI/issues"
+Homepage = "https://github.com/dpalmer-anl/pyELSI"
+Repository = "https://github.com/dpalmer-anl/pyELSI"
+"Bug Tracker" = "https://github.com/dpalmer-anl/pyELSI/issues"
 "ELSI Upstream" = "https://gitlab.com/ElectronicStructureLibrary/elsi-interface"
 
 [tool.scikit-build]
