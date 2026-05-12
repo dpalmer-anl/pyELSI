@@ -1,0 +1,63 @@
+[build-system]
+requires = [
+  "scikit-build-core>=0.10",
+  "pybind11>=2.12",
+  "numpy>=2.0",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "pyELSI"
+version = "0.1.0"
+description = "Python interface to ELSI (ELectronic Structure Infrastructure)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "pyELSI contributors" }]
+keywords = ["elsi", "electronic-structure", "eigensolver", "density-matrix", "hpc"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: BSD License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+  "numpy>=2.0",
+]
+
+[project.optional-dependencies]
+scipy = ["scipy>=1.12"]
+test = ["pytest>=8", "scipy>=1.12", "matplotlib>=3.8"]
+docs = ["mkdocs>=1.6", "mkdocs-material>=9.5", "mkdocstrings[python]>=0.25", "mike>=2.1"]
+mpi = ["mpi4py>=3.1"]
+
+[project.urls]
+Homepage = "https://github.com/GITHUB_USERNAME/pyELSI"
+Repository = "https://github.com/GITHUB_USERNAME/pyELSI"
+"Bug Tracker" = "https://github.com/GITHUB_USERNAME/pyELSI/issues"
+"ELSI Upstream" = "https://gitlab.com/ElectronicStructureLibrary/elsi-interface"
+
+[tool.scikit-build]
+cmake.version = ">=3.20"
+wheel.packages = ["src/pyelsi"]
+sdist.include = [
+  "CMakeLists.txt",
+  "cmake/**",
+  "cpp/**",
+  "src/**",
+  "tests/**",
+  "docs/**",
+  "README.md",
+  "LICENSE",
+]
+build-dir = "_skbuild"
+
+[tool.scikit-build.cmake.define]
+PYELSI_ENABLE_MPI = "ON"
+PYELSI_ENABLE_CUDA = "OFF"
+PYELSI_FETCH_ELSI = "ON"
+PYELSI_ELSI_GIT_TAG = "v2.11.0"
+

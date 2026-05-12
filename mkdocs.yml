@@ -1,0 +1,21 @@
+site_name: pyELSI
+site_description: Python interface to ELSI (ELectronic Structure Infrastructure)
+repo_url: https://gitlab.com/ElectronicStructureLibrary/elsi-interface
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - content.code.copy
+markdown_extensions:
+  - admonition
+  - pymdownx.superfences
+  - pymdownx.details
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - API:
+      - Overview: api/index.md
+      - pyelsi.eigh: api/eigh.md
+      - pyelsi.density_matrix: api/density_matrix.md
+  - Troubleshooting: troubleshooting.md

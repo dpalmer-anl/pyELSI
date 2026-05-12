@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    name: Build & test (Ubuntu, Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            gfortran \
+            libopenblas-dev \
+            libopenmpi-dev \
+            openmpi-bin \
+            cmake \
+            ninja-build
+
+      - name: Cache ELSI build
+        uses: actions/cache@v4
+        with:
+          path: _skbuild
+          key: elsi-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('CMakeLists.txt', 'pyproject.toml') }}
+          restore-keys: |
+            elsi-${{ runner.os }}-py${{ matrix.python-version }}-
+
+      - name: Install Python build dependencies
+        run: pip install scikit-build-core pybind11 numpy
+
+      - name: Build package
+        run: pip install -e ".[test,mpi]" --no-build-isolation
+
+      - name: Run serial tests
+        run: |
+          python -m pytest tests/ -v -s \
+            --ignore=tests/test_scaling_benchmark.py \
+            -m "not slow and not scaling_benchmark"
+
+      - name: Run MPI smoke tests (2 ranks)
+        run: |
+          mpirun -n 2 python -m pytest tests/test_mpi_smoke.py -v -s

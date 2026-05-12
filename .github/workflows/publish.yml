@@ -1,0 +1,88 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  # ── 1. Build source distribution ──────────────────────────────────────────
+  build-sdist:
+    name: Build sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build frontend
+        run: pip install build
+
+      - name: Build sdist
+        run: python -m build --sdist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
+
+  # ── 2. Build Linux wheel (manylinux_2_28 / x86_64) ───────────────────────
+  build-wheel:
+    name: Build wheel (manylinux_2_28_x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheel with cibuildwheel
+        uses: pypa/cibuildwheel@v2.22
+        env:
+          CIBW_BUILD: cp311-manylinux_x86_64 cp312-manylinux_x86_64
+          CIBW_MANYLINUX_X86_64_IMAGE: quay.io/pypa/manylinux_2_28_x86_64
+
+          # Install system dependencies inside the manylinux container
+          CIBW_BEFORE_ALL_LINUX: |
+            dnf install -y epel-release
+            dnf install -y \
+              openmpi-devel \
+              openblas-devel \
+              cmake \
+              ninja-build \
+              gcc-gfortran
+            echo "/usr/lib64/openmpi/bin" >> $GITHUB_PATH
+
+          CIBW_ENVIRONMENT_LINUX: >
+            PATH="/usr/lib64/openmpi/bin:$PATH"
+            CMAKE_ARGS="-DPYELSI_ENABLE_MPI=ON -DPYELSI_FETCH_ELSI=ON"
+
+          CIBW_BUILD_FRONTEND: "pip; args: --no-build-isolation"
+
+          # Smoke-test the wheel
+          CIBW_TEST_REQUIRES: pytest scipy mpi4py
+          CIBW_TEST_COMMAND: >
+            python -m pytest {project}/tests/test_eigh_dense.py
+            {project}/tests/test_density_matrix.py -v -s
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-wheel
+          path: wheelhouse/*.whl
+
+  # ── 3. Publish to PyPI ────────────────────────────────────────────────────
+  publish:
+    name: Publish to PyPI
+    needs: [build-sdist, build-wheel]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write   # required for trusted publishing (OIDC)
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

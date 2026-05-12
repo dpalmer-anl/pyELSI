@@ -1,0 +1,45 @@
+# Python / build artefacts
+.venv/
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.dll
+*.dylib
+*.o
+*.a
+*.lib
+*.obj
+*.exe
+*.exp
+*.pdb
+*.egg-info/
+dist/
+build/
+_skbuild/
+
+# Test / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+
+# Editors
+.idea/
+.vscode/
+
+# Docs
+site/
+wheelhouse/
+
+# Benchmark outputs (keep PNGs for README)
+outputs/
+!outputs/*.png
+
+# Vendored ELSI sources (fetched at build time via PYELSI_FETCH_ELSI=ON)
+third_party/
+
+# Solver log files
+logPEXSI*
+log_ntpoly*
