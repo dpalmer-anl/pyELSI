@@ -33,8 +33,8 @@ coverage.xml
 site/
 wheelhouse/
 
-# Benchmark outputs (keep PNGs for README)
-outputs/
+# Benchmark outputs — ignore everything except scaling PNGs (needed for README)
+outputs/*
 !outputs/*.png
 
 # Vendored ELSI sources (fetched at build time via PYELSI_FETCH_ELSI=ON)
