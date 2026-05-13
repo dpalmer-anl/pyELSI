@@ -76,17 +76,30 @@ Optional solver dependencies:
 | MAGMA | CUDA toolkit + MAGMA library (`-DPYELSI_ENABLE_CUDA=ON`) |
 | DLAF | DLA-Future library (`-DPYELSI_ENABLE_DLAF=ON`) |
 
-**Conda environment (recommended for development):**
+**Conda environment (recommended for development and cluster installs):**
 
 ```bash
 conda create -n pyelsi python=3.11 cmake fortran-compiler c-compiler cxx-compiler \
-    openmpi openblas scalapack numpy scipy mpi4py matplotlib pytest
+    openmpi openblas scalapack numpy scipy mpi4py matplotlib pytest \
+    scikit-build-core pybind11
 conda activate pyelsi
 pip install -e ".[test,mpi]" --no-build-isolation
 ```
 
-> `--no-build-isolation` is required so that `pip` uses the conda environment's
-> Python headers and MPI libraries rather than an isolated build environment.
+> **Why `--no-build-isolation`?**  Without it, pip creates an isolated build
+> environment with its own Python, which may not find the conda environment's
+> MPI headers and libraries.  With `--no-build-isolation`, pip uses the active
+> conda environment directly — but this means the *build-system dependencies*
+> (`scikit-build-core`, `pybind11`) must already be installed there, hence the
+> extra packages in the `conda create` line above.
+
+> **Stale CMake cache.**  If a previous build attempt failed, the `_skbuild/`
+> directory in the project root may contain an incomplete CMake cache that will
+> cause the same errors to repeat.  Delete it before retrying:
+> ```bash
+> rm -rf _skbuild
+> pip install -e ".[test,mpi]" --no-build-isolation
+> ```
 
 ## Usage — serial
 

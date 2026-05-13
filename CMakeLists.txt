@@ -6,7 +6,14 @@ include(FetchContent)
 
 # ELSI (v2.11.0) declares cmake_minimum_required(VERSION 3.0).
 # CMake 4+ removed compatibility with policies <3.5 unless explicitly set.
+# The variable is silently ignored on CMake <4.0 where it is not needed.
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+
+# Prefer libraries from the active conda environment over system-wide libraries
+# (e.g., prevents accidentally picking up MKL from a different conda env).
+if(DEFINED ENV{CONDA_PREFIX})
+  list(PREPEND CMAKE_PREFIX_PATH "$ENV{CONDA_PREFIX}")
+endif()
 
 option(PYELSI_ENABLE_MPI "Enable MPI support" ON)
 option(PYELSI_ENABLE_CUDA "Enable CUDA support" OFF)
@@ -79,7 +86,14 @@ elseif(PYELSI_FETCH_ELSI)
     GIT_TAG ${PYELSI_ELSI_GIT_TAG}
     GIT_SHALLOW TRUE
   )
-  FetchContent_MakeAvailable(elsi_interface)
+  # Populate-only: download the source without calling add_subdirectory().
+  # The explicit add_subdirectory() below is the single point of configuration,
+  # which avoids the duplicate-target errors that FetchContent_MakeAvailable()
+  # causes when it also calls add_subdirectory() on the same source tree.
+  FetchContent_GetProperties(elsi_interface)
+  if(NOT elsi_interface_POPULATED)
+    FetchContent_Populate(elsi_interface)
+  endif()
   set(_elsi_src_dir "${elsi_interface_SOURCE_DIR}")
 else()
   message(FATAL_ERROR "ELSI source not found. Either vendor into third_party/elsi/elsi-interface or set -DPYELSI_FETCH_ELSI=ON.")
