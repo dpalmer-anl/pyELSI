@@ -101,6 +101,29 @@ pip install -e ".[test,mpi]" --no-build-isolation
 > pip install -e ".[test,mpi]" --no-build-isolation
 > ```
 
+> **HPC clusters — conflicting modules / BLAS.**  On clusters where multiple
+> Python environments are loaded simultaneously (e.g. a PyTorch/CUDA module **and**
+> the pyelsi conda env), CMake can pick up BLAS/LAPACK from the wrong environment
+> — typically an incomplete MKL installation — leading to runtime errors like
+> `Intel MKL FATAL ERROR: Cannot load libmkl_def.so.2`.
+>
+> pyELSI's build system automatically defaults to `BLA_VENDOR=OpenBLAS` when
+> building inside a conda environment, and bakes the conda env's `lib/` directory
+> into the module RPATH so runtime loading is correct.  If you still see MKL
+> errors, ensure conflicting modules are unloaded **before** building and running:
+> ```bash
+> module purge                    # or selectively unload PyTorch / CUDA modules
+> conda activate pyelsi
+> rm -rf _skbuild
+> pip install -e ".[test,mpi]" --no-build-isolation
+> ```
+> If you intentionally want to use MKL (e.g. on an Intel cluster), override the
+> vendor:
+> ```bash
+> pip install -e ".[test,mpi]" --no-build-isolation \
+>     --config-settings=cmake.define.BLA_VENDOR=Intel10_64lp
+> ```
+
 ## Usage — serial
 
 ### Dense eigenvalue problem (ELPA)

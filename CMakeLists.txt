@@ -54,11 +54,35 @@ endif()
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
 
-# --- Threads / BLAS / LAPACK ---
+# --- Threads / BLAS / LAPACK / ScaLAPACK ---
 find_package(Threads REQUIRED)
 
-# We prefer linking against whatever BLAS/LAPACK is available at build time.
-# For wheels, a controlled manylinux build environment should provide OpenBLAS.
+# ── Conda-environment hardening ──────────────────────────────────────────────
+# On HPC clusters it is common to have multiple conda environments active at
+# once (e.g. the build environment + a PyTorch/CUDA module).  CMake's default
+# BLAS search walks LD_LIBRARY_PATH and can accidentally latch onto an
+# incomplete MKL installation from a foreign environment, causing runtime
+# "undefined symbol" errors.  Two countermeasures are applied when building
+# inside a conda environment:
+#
+#   1. BLA_VENDOR=OpenBLAS (default, user-overridable) — instructs FindBLAS to
+#      only accept OpenBLAS, so an MKL found on LD_LIBRARY_PATH is ignored.
+#      Users who intentionally want MKL can override:
+#        pip install ... --config-settings=cmake.define.BLA_VENDOR=Intel10_64lp
+#
+#   2. RPATH — the conda env's lib/ is baked into the .so so that the dynamic
+#      linker resolves runtime dependencies from the correct env regardless of
+#      LD_LIBRARY_PATH at the time the Python module is imported.
+if(DEFINED ENV{CONDA_PREFIX})
+  if(NOT DEFINED CACHE{BLA_VENDOR})
+    set(BLA_VENDOR "OpenBLAS" CACHE STRING
+        "Preferred BLAS vendor (e.g. OpenBLAS, Intel10_64lp, FLAME, Generic). \
+Override with -DBLA_VENDOR=<name> if you want a different BLAS.")
+  endif()
+  list(PREPEND CMAKE_INSTALL_RPATH "$ENV{CONDA_PREFIX}/lib")
+  set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
+endif()
+
 find_package(BLAS REQUIRED)
 find_package(LAPACK REQUIRED)
 find_package(SCALAPACK)
