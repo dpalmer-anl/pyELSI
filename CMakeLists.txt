@@ -133,6 +133,15 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 add_subdirectory("${_elsi_src_dir}" elsi_build)
 
+# ChASE (bundled in ELSI v2.11.0) defines chase::mpi::make_unique, which
+# becomes ambiguous with std::make_unique under C++17 / GCC >= 14 because
+# GCC 14 changed std::make_unique's return type to std::__detail::__unique_ptr_t.
+# Compiling ChASE's own translation units in C++14 mode avoids the ambiguity
+# while the rest of pyELSI stays on C++17.
+if(TARGET chase)
+  set_target_properties(chase PROPERTIES CXX_STANDARD 14 CXX_STANDARD_REQUIRED ON)
+endif()
+
 pybind11_add_module(_pyelsi_core
   cpp/pyelsi_module.cpp
 )
