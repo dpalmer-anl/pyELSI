@@ -403,20 +403,17 @@ mpirun -n 2 python -m pytest tests/test_mpi_smoke.py -v -s
 
 The scaling benchmark (`tests/test_scaling_benchmark.py`) times each solver
 over 15 log-spaced matrix sizes from N = 100 to N = 10,000 and saves a plot to
-`outputs/scaling_nproc_{N}.png`.
+`outputs/scaling_benchmark_{nprocs}proc.png`.
 
 ```bash
-# serial
-PYELSI_RUN_SCALING_BENCH=1 pytest tests/test_scaling_benchmark.py -v -s
+# Serial
+PYELSI_RUN_SCALING_BENCH=1 python -m pytest tests/test_scaling_benchmark.py -v -s
 
-# 2 MPI ranks
-PYELSI_RUN_SCALING_BENCH=1 mpirun -n 2 python -m pytest tests/test_scaling_benchmark.py -v -s
-
-# 4 MPI ranks
+# 4 MPI ranks (dense solvers use a 2×2 ScaLAPACK block-cyclic grid)
 PYELSI_RUN_SCALING_BENCH=1 mpirun -n 4 python -m pytest tests/test_scaling_benchmark.py -v -s
 ```
 
-### Expected complexity (serial)
+### Expected complexity
 
 Solvers not compiled in (e.g. SIPS without SLEPc) are silently omitted from the plot.
 
@@ -429,7 +426,25 @@ Solvers not compiled in (e.g. SIPS without SLEPc) are silently omitted from the 
 | NTPoly DM | O(N)       | Sparse | Linear for sufficiently sparse matrices |
 | SIPS eigh | O(N·k²)    | Sparse | k = n\_state; requires SLEPc |
 
-![Serial scaling (1 process)](outputs/scaling_nproc_1.png)
+![Serial scaling (1 process)](outputs/scaling_benchmark_1proc.png)
+
+### Strong scaling (fixed N=4000)
+
+The strong-scaling benchmark (`tests/test_strong_scaling.py`) fixes N = 4,000
+and measures wall time at 1, 2, and 4 MPI processes.  Run once per process
+count; the combined plot is written automatically once ≥ 2 counts are present.
+
+```bash
+# Populate data for each process count, then view outputs/strong_scaling.png
+PYELSI_RUN_SCALING_BENCH=1 python -m pytest tests/test_strong_scaling.py -v -s
+PYELSI_RUN_SCALING_BENCH=1 mpirun -n 2 python -m pytest tests/test_strong_scaling.py -v -s
+PYELSI_RUN_SCALING_BENCH=1 mpirun -n 4 python -m pytest tests/test_strong_scaling.py -v -s
+```
+
+Timings are cached in `outputs/strong_scaling_{P}proc.json` so individual
+process counts can be re-run without re-timing the others.
+
+![Strong scaling N=4000](outputs/strong_scaling.png)
 
 ---
 This project credits and builds on [ELSI (ELectronic Structure Infrastructure)](https://wordpress.elsi-interchange.org/).

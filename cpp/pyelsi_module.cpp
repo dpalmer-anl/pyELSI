@@ -15,9 +15,19 @@
 namespace py = pybind11;
 
 extern "C" {
-int Csys2blacs_handle(MPI_Comm comm);
+int  Csys2blacs_handle(MPI_Comm comm);
 void Cblacs_get(int context, int request, int* value);
 void Cblacs_gridinit(int* context, const char* order, int nprow, int npcol);
+void Cblacs_gridinfo(int context, int* nprow, int* npcol, int* myrow, int* mycol);
+void Cblacs_gridexit(int context);
+// ScaLAPACK: compute the number of rows/columns owned by a given process
+int  numroc_(const int* n, const int* nb, const int* iproc,
+             const int* isrcproc, const int* nprocs);
+// ScaLAPACK: initialise a distributed-array descriptor
+void descinit_(int* desc, const int* m, const int* n,
+               const int* mb, const int* nb,
+               const int* irsrc, const int* icsrc,
+               const int* ictxt, const int* lld, int* info);
 }
 
 static py::dict build_info_dict() {
@@ -57,12 +67,75 @@ static void maybe_mpi_init() {
   }
 }
 
+// Return the most square (nprow, npcol) factorisation of `nprocs`.
+static std::pair<int,int> best_pgrid(int nprocs) {
+  int nprow = static_cast<int>(std::sqrt(static_cast<double>(nprocs)));
+  while (nprocs % nprow != 0) --nprow;
+  return {nprow, nprocs / nprow};
+}
+
+// Create a BLACS context for `comm` using the most square-ish process grid.
+// For MPI_COMM_SELF (1 rank) this is 1×1; for MPI_COMM_WORLD with P ranks
+// it is the factorisation closest to √P × √P.  All ranks in `comm` receive a
+// valid context (unlike the old hardcoded 1×1 which left ranks 1..P-1 with
+// context = -1 when called with MPI_COMM_WORLD).
 static int blacs_ctxt_1x1(MPI_Comm comm) {
-  // Tie BLACS context to the provided communicator. This matters under mpirun
-  // when creating a per-rank 1x1 context (MPI_COMM_SELF).
+  int size = 1;
+  MPI_Comm_size(comm, &size);
+  auto [nprow, npcol] = best_pgrid(size);
   int ictxt = Csys2blacs_handle(comm);
-  Cblacs_gridinit(&ictxt, "r", 1, 1);
+  Cblacs_gridinit(&ictxt, "r", nprow, npcol);
   return ictxt;
+}
+
+// Copy local block-cyclic portion out of a global Fortran-col-major matrix.
+// All arguments use 0-based local and global indices.
+static void extract_block_cyclic(
+    const double* global, double* local,
+    int n, int nb, int nprow, int npcol,
+    int myrow, int mycol, int local_rows, int local_cols)
+{
+  for (int jloc = 0; jloc < local_cols; ++jloc) {
+    const int gj = ((jloc / nb) * npcol + mycol) * nb + (jloc % nb);
+    for (int iloc = 0; iloc < local_rows; ++iloc) {
+      const int gi = ((iloc / nb) * nprow + myrow) * nb + (iloc % nb);
+      // Fortran col-major: element (gi, gj) lives at global[gi + gj*n]
+      local[iloc + jloc * local_rows] =
+          (gi < n && gj < n) ? global[gi + (std::size_t)gj * n] : 0.0;
+    }
+  }
+}
+
+// Scatter local block-cyclic data back into a zero-initialised global buffer.
+// After calling this on all ranks, MPI_Allreduce(SUM) reconstructs the full matrix.
+static void collect_block_cyclic(
+    const double* local, double* global,
+    int n, int nb, int nprow, int npcol,
+    int myrow, int mycol, int local_rows, int local_cols)
+{
+  for (int jloc = 0; jloc < local_cols; ++jloc) {
+    const int gj = ((jloc / nb) * npcol + mycol) * nb + (jloc % nb);
+    for (int iloc = 0; iloc < local_rows; ++iloc) {
+      const int gi = ((iloc / nb) * nprow + myrow) * nb + (iloc % nb);
+      if (gi < n && gj < n)
+        global[gi + (std::size_t)gj * n] = local[iloc + jloc * local_rows];
+    }
+  }
+}
+
+// Build the ScaLAPACK descriptor for a distributed n×n matrix.
+// Sets lld = max(1, local_rows) and throws on descinit_ error.
+static void make_dist_desc(int* desc, int n_basis, int nb, int ictxt,
+                            int local_rows)
+{
+  const int izero = 0;
+  int lld = std::max(1, local_rows);
+  int info = 0;
+  descinit_(desc, &n_basis, &n_basis, &nb, &nb,
+            &izero, &izero, &ictxt, &lld, &info);
+  if (info != 0)
+    throw std::runtime_error(
+        "descinit_ failed (info=" + std::to_string(info) + ")");
 }
 
 static void apply_options(elsi_handle h, const std::map<std::string, py::object>& opts) {
@@ -150,133 +223,248 @@ static py::tuple elsi_ev_real_dense(py::array_t<double, py::array::f_style | py:
                                     py::object S_obj, int solver, double n_electron, int n_state,
                                     py::dict backend_opts, bool want_vectors) {
   maybe_mpi_init();
-
   if (H.ndim() != 2 || H.shape(0) != H.shape(1)) throw std::runtime_error("H must be a square 2D array");
   const int n_basis = static_cast<int>(H.shape(0));
 
-  int world_size = 1;
+  int world_rank = 0, world_size = 1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
   MPI_Comm_size(MPI_COMM_WORLD, &world_size);
   const bool force_single_proc =
       world_size > 1 &&
       ((std::getenv("PYELSI_FORCE_SINGLE_PROC") != nullptr) ||
        (backend_opts.contains("force_single_proc") && backend_opts["force_single_proc"].cast<int>() != 0));
 
+  // Build opts map once
+  std::map<std::string, py::object> opts;
+  for (auto item : backend_opts) {
+    opts[py::reinterpret_borrow<py::str>(item.first).cast<std::string>()] =
+        py::reinterpret_borrow<py::object>(item.second);
+  }
+
+  // Overlap matrix (global, on all ranks)
   py::array_t<double, py::array::f_style | py::array::forcecast> S;
   py::array_t<double, py::array::f_style> S_dummy;
-  double* ovlp = nullptr;
+  double* ovlp_global = nullptr;
+  const bool unit_ovlp = S_obj.is_none();
+  if (!S_obj.is_none()) {
+    S = S_obj.cast<py::array_t<double, py::array::f_style | py::array::forcecast>>();
+    if (S.ndim() != 2 || S.shape(0) != n_basis || S.shape(1) != n_basis)
+      throw std::runtime_error("S must be (n,n)");
+    ovlp_global = static_cast<double*>(S.mutable_data());
+  } else {
+    S_dummy = identity_fortran_colmajor(n_basis);
+    ovlp_global = static_cast<double*>(S_dummy.mutable_data());
+  }
 
-  // Create handle
+  // ---- Serial / force_single_proc path ----
+  if (force_single_proc || world_size == 1) {
+    elsi_handle h = nullptr;
+    c_elsi_init(&h, solver, 1, 0, n_basis, n_electron, n_state);
+    const MPI_Comm comm = force_single_proc ? MPI_COMM_SELF : MPI_COMM_WORLD;
+    c_elsi_set_mpi(h, MPI_Comm_c2f(comm));
+    c_elsi_set_mpi_global(h, MPI_Comm_c2f(MPI_COMM_WORLD));
+    c_elsi_set_blacs(h, blacs_ctxt_1x1(comm), 32);
+    c_elsi_set_spin_degeneracy(h, 1.0);
+    c_elsi_set_mu_broaden_scheme(h, 0);
+    c_elsi_set_mu_broaden_width(h, 1.0e-12);
+    c_elsi_set_unit_ovlp(h, unit_ovlp ? 1 : 0);
+    apply_options(h, opts);
+
+    py::array_t<double> eval({n_basis});
+    py::array_t<double, py::array::f_style> evec({n_basis, n_basis});
+    double* ham = static_cast<double*>(H.mutable_data());
+    c_elsi_ev_real(h, ham, ovlp_global,
+                   static_cast<double*>(eval.mutable_data()),
+                   static_cast<double*>(evec.mutable_data()));
+    c_elsi_finalize(h);
+    if (!want_vectors) return py::make_tuple(eval, py::none());
+    return py::make_tuple(eval, evec);
+  }
+
+  // ---- Distributed MPI path ----
+  auto [nprow, npcol] = best_pgrid(world_size);
+  const int nb = 32;
+
+  int ictxt = Csys2blacs_handle(MPI_COMM_WORLD);
+  Cblacs_gridinit(&ictxt, "r", nprow, npcol);
+  int nprow_q, npcol_q, myrow, mycol;
+  Cblacs_gridinfo(ictxt, &nprow_q, &npcol_q, &myrow, &mycol);
+
+  const int izero = 0;
+  int local_rows = numroc_(&n_basis, &nb, &myrow, &izero, &nprow_q);
+  int local_cols = numroc_(&n_basis, &nb, &mycol, &izero, &npcol_q);
+
+  int desc[9]; make_dist_desc(desc, n_basis, nb, ictxt, local_rows);
+
+  const std::size_t local_sz = static_cast<std::size_t>(std::max(1, local_rows * local_cols));
+  std::vector<double> H_local(local_sz, 0.0);
+  std::vector<double> S_local(local_sz, 0.0);
+  std::vector<double> evec_local(local_sz, 0.0);
+
+  extract_block_cyclic(static_cast<const double*>(H.data()), H_local.data(),
+                       n_basis, nb, nprow_q, npcol_q, myrow, mycol,
+                       local_rows, local_cols);
+  if (!unit_ovlp)
+    extract_block_cyclic(ovlp_global, S_local.data(),
+                         n_basis, nb, nprow_q, npcol_q, myrow, mycol,
+                         local_rows, local_cols);
+
   elsi_handle h = nullptr;
-  // Default: MULTI_PROC so ELSI initializes MPI/BLACS metadata.
-  // For MPI unit tests we allow an override to run per-rank serial by using
-  // MPI_COMM_SELF (size=1) while still using MULTI_PROC mode.
   c_elsi_init(&h, solver, 1, 0, n_basis, n_electron, n_state);
-  const MPI_Comm elsi_comm_ev = force_single_proc ? MPI_COMM_SELF : MPI_COMM_WORLD;
-  c_elsi_set_mpi(h, MPI_Comm_c2f(elsi_comm_ev));
+  c_elsi_set_mpi(h, MPI_Comm_c2f(MPI_COMM_WORLD));
   c_elsi_set_mpi_global(h, MPI_Comm_c2f(MPI_COMM_WORLD));
-  const int ictxt = blacs_ctxt_1x1(elsi_comm_ev);
-  c_elsi_set_blacs(h, ictxt, 32);
+  c_elsi_set_blacs(h, ictxt, nb);
   c_elsi_set_spin_degeneracy(h, 1.0);
   c_elsi_set_mu_broaden_scheme(h, 0);
   c_elsi_set_mu_broaden_width(h, 1.0e-12);
-
-  if (!S_obj.is_none()) {
-    S = S_obj.cast<py::array_t<double, py::array::f_style | py::array::forcecast>>();
-    if (S.ndim() != 2 || S.shape(0) != n_basis || S.shape(1) != n_basis) throw std::runtime_error("S must be (n,n)");
-    ovlp = static_cast<double*>(S.mutable_data());
-    c_elsi_set_unit_ovlp(h, 0);
-  } else {
-    S_dummy = identity_fortran_colmajor(n_basis);
-    ovlp = static_cast<double*>(S_dummy.mutable_data());
-    c_elsi_set_unit_ovlp(h, 1);
-  }
-
-  std::map<std::string, py::object> opts;
-  for (auto item : backend_opts) {
-    auto k = py::reinterpret_borrow<py::str>(item.first);
-    auto v = py::reinterpret_borrow<py::object>(item.second);
-    opts[k.cast<std::string>()] = std::move(v);
-  }
+  c_elsi_set_unit_ovlp(h, unit_ovlp ? 1 : 0);
   apply_options(h, opts);
 
   py::array_t<double> eval({n_basis});
+  c_elsi_ev_real(h, H_local.data(),
+                 unit_ovlp ? S_local.data() : S_local.data(),
+                 static_cast<double*>(eval.mutable_data()),
+                 evec_local.data());
+  c_elsi_finalize(h);
+
+  // Eigenvalues are replicated on all ranks by ELPA — broadcast from rank 0
+  // to be safe with other solvers.
+  MPI_Bcast(static_cast<double*>(eval.mutable_data()), n_basis, MPI_DOUBLE,
+            0, MPI_COMM_WORLD);
+
   py::array_t<double, py::array::f_style> evec({n_basis, n_basis});
-
-  double* ham = static_cast<double*>(H.mutable_data());
-  double* ev = static_cast<double*>(eval.mutable_data());
-  double* vec = want_vectors ? static_cast<double*>(evec.mutable_data()) : nullptr;
-
   if (want_vectors) {
-    c_elsi_ev_real(h, ham, ovlp, ev, vec);
-  } else {
-    // ELSI API always takes evec pointer; pass allocated but ignore
-    c_elsi_ev_real(h, ham, ovlp, ev, static_cast<double*>(evec.mutable_data()));
+    double* evec_ptr = static_cast<double*>(evec.mutable_data());
+    std::memset(evec_ptr, 0, static_cast<std::size_t>(n_basis) * n_basis * sizeof(double));
+    collect_block_cyclic(evec_local.data(), evec_ptr,
+                         n_basis, nb, nprow_q, npcol_q, myrow, mycol,
+                         local_rows, local_cols);
+    MPI_Allreduce(MPI_IN_PLACE, evec_ptr,
+                  static_cast<int>(static_cast<std::size_t>(n_basis) * n_basis),
+                  MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
   }
 
-  c_elsi_finalize(h);
+  Cblacs_gridexit(ictxt);
 
   if (!want_vectors) return py::make_tuple(eval, py::none());
   return py::make_tuple(eval, evec);
 }
 
 static py::tuple elsi_dm_real_dense(py::array_t<double, py::array::f_style | py::array::forcecast> H,
-                                    py::object S_obj, int solver, double n_electron, int n_state, py::dict backend_opts) {
+                                    py::object S_obj, int solver, double n_electron, int n_state,
+                                    py::dict backend_opts) {
   maybe_mpi_init();
   if (H.ndim() != 2 || H.shape(0) != H.shape(1)) throw std::runtime_error("H must be a square 2D array");
   const int n_basis = static_cast<int>(H.shape(0));
 
-  int world_size = 1;
+  int world_rank = 0, world_size = 1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
   MPI_Comm_size(MPI_COMM_WORLD, &world_size);
   const bool force_single_proc =
       world_size > 1 &&
       ((std::getenv("PYELSI_FORCE_SINGLE_PROC") != nullptr) ||
        (backend_opts.contains("force_single_proc") && backend_opts["force_single_proc"].cast<int>() != 0));
 
+  std::map<std::string, py::object> opts;
+  for (auto item : backend_opts) {
+    opts[py::reinterpret_borrow<py::str>(item.first).cast<std::string>()] =
+        py::reinterpret_borrow<py::object>(item.second);
+  }
+
   py::array_t<double, py::array::f_style | py::array::forcecast> S;
   py::array_t<double, py::array::f_style> S_dummy;
-  double* ovlp = nullptr;
+  double* ovlp_global = nullptr;
+  const bool unit_ovlp = S_obj.is_none();
+  if (!S_obj.is_none()) {
+    S = S_obj.cast<py::array_t<double, py::array::f_style | py::array::forcecast>>();
+    if (S.ndim() != 2 || S.shape(0) != n_basis || S.shape(1) != n_basis)
+      throw std::runtime_error("S must be (n,n)");
+    ovlp_global = static_cast<double*>(S.mutable_data());
+  } else {
+    S_dummy = identity_fortran_colmajor(n_basis);
+    ovlp_global = static_cast<double*>(S_dummy.mutable_data());
+  }
+
+  // ---- Serial / force_single_proc path ----
+  if (force_single_proc || world_size == 1) {
+    elsi_handle h = nullptr;
+    c_elsi_init(&h, solver, 1, 0, n_basis, n_electron, n_state);
+    const MPI_Comm comm = force_single_proc ? MPI_COMM_SELF : MPI_COMM_WORLD;
+    c_elsi_set_mpi(h, MPI_Comm_c2f(comm));
+    c_elsi_set_mpi_global(h, MPI_Comm_c2f(MPI_COMM_WORLD));
+    c_elsi_set_blacs(h, blacs_ctxt_1x1(comm), 32);
+    c_elsi_set_spin_degeneracy(h, 1.0);
+    c_elsi_set_mu_broaden_scheme(h, 0);
+    c_elsi_set_mu_broaden_width(h, 1.0e-12);
+    c_elsi_set_unit_ovlp(h, unit_ovlp ? 1 : 0);
+    apply_options(h, opts);
+
+    py::array_t<double, py::array::f_style> dm({n_basis, n_basis});
+    double energy_val = 0.0;
+    c_elsi_dm_real(h, static_cast<double*>(H.mutable_data()), ovlp_global,
+                   static_cast<double*>(dm.mutable_data()), &energy_val);
+    c_elsi_finalize(h);
+    return py::make_tuple(dm, energy_val);
+  }
+
+  // ---- Distributed MPI path ----
+  auto [nprow, npcol] = best_pgrid(world_size);
+  const int nb = 32;
+
+  int ictxt = Csys2blacs_handle(MPI_COMM_WORLD);
+  Cblacs_gridinit(&ictxt, "r", nprow, npcol);
+  int nprow_q, npcol_q, myrow, mycol;
+  Cblacs_gridinfo(ictxt, &nprow_q, &npcol_q, &myrow, &mycol);
+
+  const int izero = 0;
+  int local_rows = numroc_(&n_basis, &nb, &myrow, &izero, &nprow_q);
+  int local_cols = numroc_(&n_basis, &nb, &mycol, &izero, &npcol_q);
+
+  int desc[9]; make_dist_desc(desc, n_basis, nb, ictxt, local_rows);
+
+  const std::size_t local_sz = static_cast<std::size_t>(std::max(1, local_rows * local_cols));
+  std::vector<double> H_local(local_sz, 0.0);
+  std::vector<double> S_local(local_sz, 0.0);
+  std::vector<double> DM_local(local_sz, 0.0);
+
+  extract_block_cyclic(static_cast<const double*>(H.data()), H_local.data(),
+                       n_basis, nb, nprow_q, npcol_q, myrow, mycol,
+                       local_rows, local_cols);
+  if (!unit_ovlp)
+    extract_block_cyclic(ovlp_global, S_local.data(),
+                         n_basis, nb, nprow_q, npcol_q, myrow, mycol,
+                         local_rows, local_cols);
 
   elsi_handle h = nullptr;
   c_elsi_init(&h, solver, 1, 0, n_basis, n_electron, n_state);
-  const MPI_Comm elsi_comm_dm = force_single_proc ? MPI_COMM_SELF : MPI_COMM_WORLD;
-  c_elsi_set_mpi(h, MPI_Comm_c2f(elsi_comm_dm));
+  c_elsi_set_mpi(h, MPI_Comm_c2f(MPI_COMM_WORLD));
   c_elsi_set_mpi_global(h, MPI_Comm_c2f(MPI_COMM_WORLD));
-  const int ictxt_dm = blacs_ctxt_1x1(elsi_comm_dm);
-  c_elsi_set_blacs(h, ictxt_dm, 32);
+  c_elsi_set_blacs(h, ictxt, nb);
   c_elsi_set_spin_degeneracy(h, 1.0);
   c_elsi_set_mu_broaden_scheme(h, 0);
   c_elsi_set_mu_broaden_width(h, 1.0e-12);
-
-  if (!S_obj.is_none()) {
-    S = S_obj.cast<py::array_t<double, py::array::f_style | py::array::forcecast>>();
-    if (S.ndim() != 2 || S.shape(0) != n_basis || S.shape(1) != n_basis) throw std::runtime_error("S must be (n,n)");
-    ovlp = static_cast<double*>(S.mutable_data());
-    c_elsi_set_unit_ovlp(h, 0);
-  } else {
-    S_dummy = identity_fortran_colmajor(n_basis);
-    ovlp = static_cast<double*>(S_dummy.mutable_data());
-    c_elsi_set_unit_ovlp(h, 1);
-  }
-
-  std::map<std::string, py::object> opts;
-  for (auto item : backend_opts) {
-    auto k = py::reinterpret_borrow<py::str>(item.first);
-    auto v = py::reinterpret_borrow<py::object>(item.second);
-    opts[k.cast<std::string>()] = std::move(v);
-  }
+  c_elsi_set_unit_ovlp(h, unit_ovlp ? 1 : 0);
   apply_options(h, opts);
 
-  py::array_t<double, py::array::f_style> dm({n_basis, n_basis});
-  py::array_t<double> energy({1});
-
-  double* ham = static_cast<double*>(H.mutable_data());
-  double* dm_ptr = static_cast<double*>(dm.mutable_data());
-  double* e_ptr = static_cast<double*>(energy.mutable_data());
-
-  c_elsi_dm_real(h, ham, ovlp, dm_ptr, e_ptr);
+  double energy_val = 0.0;
+  c_elsi_dm_real(h, H_local.data(), S_local.data(), DM_local.data(), &energy_val);
   c_elsi_finalize(h);
 
-  return py::make_tuple(dm, energy.at(0));
+  // Gather DM: each rank fills its slice of a zero matrix, then sum-reduce
+  py::array_t<double, py::array::f_style> dm({n_basis, n_basis});
+  double* dm_ptr = static_cast<double*>(dm.mutable_data());
+  std::memset(dm_ptr, 0, static_cast<std::size_t>(n_basis) * n_basis * sizeof(double));
+  collect_block_cyclic(DM_local.data(), dm_ptr,
+                       n_basis, nb, nprow_q, npcol_q, myrow, mycol,
+                       local_rows, local_cols);
+  MPI_Allreduce(MPI_IN_PLACE, dm_ptr,
+                static_cast<int>(static_cast<std::size_t>(n_basis) * n_basis),
+                MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+  MPI_Bcast(&energy_val, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+  Cblacs_gridexit(ictxt);
+
+  return py::make_tuple(dm, energy_val);
 }
 
 static py::tuple elsi_dm_real_csc(py::array_t<double, py::array::c_style | py::array::forcecast> ham_val,
@@ -365,61 +553,130 @@ static py::tuple elsi_dm_real_coo(py::array_t<double, py::array::c_style | py::a
   if (ham_val.ndim() != 1) throw std::runtime_error("ham_val must be 1D");
   if (row_ind_1based.ndim() != 1 || col_ind_1based.ndim() != 1) throw std::runtime_error("row/col must be 1D");
   const int nnz = static_cast<int>(ham_val.shape(0));
-  if (row_ind_1based.shape(0) != nnz || col_ind_1based.shape(0) != nnz) throw std::runtime_error("row/col length must equal nnz");
+  if (row_ind_1based.shape(0) != nnz || col_ind_1based.shape(0) != nnz)
+    throw std::runtime_error("row/col length must equal nnz");
 
-  // matrix_format=3 (GENERIC_COO)
-  int world_size_coo = 1;
-  MPI_Comm_size(MPI_COMM_WORLD, &world_size_coo);
-  const bool force_single_proc_coo =
-      world_size_coo > 1 &&
+  int world_rank = 0, world_size = 1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+  const bool force_single_proc =
+      world_size > 1 &&
       ((std::getenv("PYELSI_FORCE_SINGLE_PROC") != nullptr) ||
        (backend_opts.contains("force_single_proc") && backend_opts["force_single_proc"].cast<int>() != 0));
-  const MPI_Comm coo_comm = force_single_proc_coo ? MPI_COMM_SELF : MPI_COMM_WORLD;
-
-  elsi_handle h = nullptr;
-  c_elsi_init(&h, solver, 1, 3, n_basis, n_electron, n_state);
-
-  c_elsi_set_mpi(h, MPI_Comm_c2f(coo_comm));
-  c_elsi_set_mpi_global(h, MPI_Comm_c2f(MPI_COMM_WORLD));
-  const int ictxt = blacs_ctxt_1x1(coo_comm);
-  c_elsi_set_blacs(h, ictxt, 32);
-
-  c_elsi_set_spin_degeneracy(h, 1.0);
-  c_elsi_set_mu_broaden_scheme(h, 0);
-  c_elsi_set_mu_broaden_width(h, 1.0e-12);
-
-  c_elsi_set_coo(h, nnz, nnz, row_ind_1based.mutable_data(), col_ind_1based.mutable_data());
-
-  py::array_t<double, py::array::c_style | py::array::forcecast> ovlp_val;
-  py::array_t<double, py::array::c_style> ovlp_dummy;
-  double* ovlp_ptr = nullptr;
-
-  if (ovlp_val_obj.is_none()) {
-    ovlp_dummy = py::array_t<double, py::array::c_style>({nnz});
-    std::memset(ovlp_dummy.mutable_data(), 0, static_cast<std::size_t>(nnz) * sizeof(double));
-    ovlp_ptr = ovlp_dummy.mutable_data();
-    c_elsi_set_unit_ovlp(h, 1);
-  } else {
-    ovlp_val = ovlp_val_obj.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>();
-    if (ovlp_val.ndim() != 1 || ovlp_val.shape(0) != nnz) throw std::runtime_error("ovlp_val must be 1D length nnz");
-    ovlp_ptr = ovlp_val.mutable_data();
-    c_elsi_set_unit_ovlp(h, 0);
-  }
 
   std::map<std::string, py::object> opts;
   for (auto item : backend_opts) {
-    auto k = py::reinterpret_borrow<py::str>(item.first);
-    auto v = py::reinterpret_borrow<py::object>(item.second);
-    opts[k.cast<std::string>()] = std::move(v);
+    opts[py::reinterpret_borrow<py::str>(item.first).cast<std::string>()] =
+        py::reinterpret_borrow<py::object>(item.second);
   }
+
+  // Overlap: load once (needed for both serial and distributed paths)
+  py::array_t<double, py::array::c_style | py::array::forcecast> ovlp_val;
+  py::array_t<double, py::array::c_style> ovlp_dummy;
+  const double* ovlp_global = nullptr;
+  const bool unit_ovlp = ovlp_val_obj.is_none();
+  if (!ovlp_val_obj.is_none()) {
+    ovlp_val = ovlp_val_obj.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>();
+    if (ovlp_val.ndim() != 1 || ovlp_val.shape(0) != nnz)
+      throw std::runtime_error("ovlp_val must be 1D length nnz");
+    ovlp_global = ovlp_val.data();
+  } else {
+    ovlp_dummy = py::array_t<double, py::array::c_style>({nnz});
+    std::memset(ovlp_dummy.mutable_data(), 0, static_cast<std::size_t>(nnz) * sizeof(double));
+    ovlp_global = ovlp_dummy.data();
+  }
+
+  const double* ham_data = ham_val.data();
+  const int*    row_data = row_ind_1based.data();
+  const int*    col_data = col_ind_1based.data();
+
+  // ---- Serial / force_single_proc path ----
+  if (force_single_proc || world_size == 1) {
+    const MPI_Comm comm = force_single_proc ? MPI_COMM_SELF : MPI_COMM_WORLD;
+    elsi_handle h = nullptr;
+    c_elsi_init(&h, solver, 1, 3, n_basis, n_electron, n_state);
+    c_elsi_set_mpi(h, MPI_Comm_c2f(comm));
+    c_elsi_set_mpi_global(h, MPI_Comm_c2f(MPI_COMM_WORLD));
+    c_elsi_set_blacs(h, blacs_ctxt_1x1(comm), 32);
+    c_elsi_set_spin_degeneracy(h, 1.0);
+    c_elsi_set_mu_broaden_scheme(h, 0);
+    c_elsi_set_mu_broaden_width(h, 1.0e-12);
+    c_elsi_set_unit_ovlp(h, unit_ovlp ? 1 : 0);
+    c_elsi_set_coo(h, nnz, nnz,
+                   row_ind_1based.mutable_data(), col_ind_1based.mutable_data());
+    apply_options(h, opts);
+
+    py::array_t<double, py::array::c_style> dm_val_out({nnz});
+    double energy_val = 0.0;
+    c_elsi_dm_real_sparse(h, const_cast<double*>(ham_data),
+                          const_cast<double*>(ovlp_global),
+                          dm_val_out.mutable_data(), &energy_val);
+    c_elsi_finalize(h);
+    return py::make_tuple(dm_val_out, energy_val);
+  }
+
+  // ---- Distributed MPI path ----
+  // Each rank owns rows [row_start, row_end).  We extract the local non-zeros
+  // (those whose row index falls in the local range) and pass only those to
+  // ELSI.  After the solve the local DM values are allreduced back to every
+  // rank in the original nnz-length ordering.
+  const int row_start = (world_rank * n_basis) / world_size;
+  const int row_end   = ((world_rank + 1) * n_basis) / world_size;
+
+  std::vector<double> H_loc, S_loc;
+  std::vector<int>    R_loc, C_loc;
+  std::vector<int>    glob_idx;  // position in the global [0, nnz) array
+
+  for (int i = 0; i < nnz; ++i) {
+    const int gi = row_data[i] - 1;  // 0-based global row
+    if (gi >= row_start && gi < row_end) {
+      H_loc.push_back(ham_data[i]);
+      S_loc.push_back(ovlp_global[i]);
+      R_loc.push_back(row_data[i]);
+      C_loc.push_back(col_data[i]);
+      glob_idx.push_back(i);
+    }
+  }
+  const int local_nnz = static_cast<int>(H_loc.size());
+
+  // Set up a proper process grid so all ranks get a valid BLACS context
+  auto [nprow, npcol] = best_pgrid(world_size);
+  int ictxt = Csys2blacs_handle(MPI_COMM_WORLD);
+  Cblacs_gridinit(&ictxt, "r", nprow, npcol);
+
+  elsi_handle h = nullptr;
+  c_elsi_init(&h, solver, 1, 3, n_basis, n_electron, n_state);
+  c_elsi_set_mpi(h, MPI_Comm_c2f(MPI_COMM_WORLD));
+  c_elsi_set_mpi_global(h, MPI_Comm_c2f(MPI_COMM_WORLD));
+  c_elsi_set_blacs(h, ictxt, 32);
+  c_elsi_set_spin_degeneracy(h, 1.0);
+  c_elsi_set_mu_broaden_scheme(h, 0);
+  c_elsi_set_mu_broaden_width(h, 1.0e-12);
+  c_elsi_set_unit_ovlp(h, unit_ovlp ? 1 : 0);
+
+  // global_nnz = nnz (each non-zero belongs to exactly one rank)
+  c_elsi_set_coo(h, nnz, local_nnz, R_loc.data(), C_loc.data());
   apply_options(h, opts);
 
-  py::array_t<double, py::array::c_style> dm_val({nnz});
-  py::array_t<double> energy({1});
-  c_elsi_dm_real_sparse(h, ham_val.mutable_data(), ovlp_ptr, dm_val.mutable_data(), energy.mutable_data());
+  std::vector<double> DM_loc(std::max(1, local_nnz), 0.0);
+  double energy_val = 0.0;
+  c_elsi_dm_real_sparse(h,
+                        H_loc.empty() ? nullptr : H_loc.data(),
+                        S_loc.empty() ? nullptr : S_loc.data(),
+                        DM_loc.data(), &energy_val);
   c_elsi_finalize(h);
+  Cblacs_gridexit(ictxt);
 
-  return py::make_tuple(dm_val, energy.at(0));
+  // Gather: each rank fills its slice of a full zero array, then Allreduce(SUM)
+  py::array_t<double, py::array::c_style> dm_val_out({nnz});
+  double* dm_ptr = dm_val_out.mutable_data();
+  std::memset(dm_ptr, 0, static_cast<std::size_t>(nnz) * sizeof(double));
+  for (int k = 0; k < local_nnz; ++k)
+    dm_ptr[glob_idx[k]] = DM_loc[k];
+  MPI_Allreduce(MPI_IN_PLACE, dm_ptr, nnz, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+  MPI_Bcast(&energy_val, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+  return py::make_tuple(dm_val_out, energy_val);
 }
 
 static py::tuple elsi_ev_complex_dense(
