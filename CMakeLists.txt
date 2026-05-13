@@ -104,6 +104,27 @@ elseif(PYELSI_FETCH_ELSI)
   FetchContent_GetProperties(elsi_interface)
   if(NOT elsi_interface_POPULATED)
     FetchContent_Populate(elsi_interface)
+
+    # ChASE in ELSI v2.11.0 uses unqualified make_unique<Matrix<T>> calls inside
+    # namespace chase::mpi.  Under C++17 / GCC >= 14, std::make_unique gained a
+    # different return type (std::__detail::__unique_ptr_t), making unqualified
+    # lookup ambiguous.  Fully-qualify the calls — matching the fix already applied
+    # in our vendored copy of this header.
+    set(_chase_matrices
+        "${elsi_interface_SOURCE_DIR}/external/ChASE/src/ChASE-MPI/chase_mpi_matrices.hpp")
+    if(EXISTS "${_chase_matrices}")
+      file(READ "${_chase_matrices}" _chase_hpp)
+      string(REPLACE
+          "make_unique<Matrix<T>>"
+          "::chase::mpi::make_unique<Matrix<T>>"
+          _chase_hpp "${_chase_hpp}")
+      string(REPLACE
+          "make_unique<Matrix<Base<T>>>"
+          "::chase::mpi::make_unique<Matrix<Base<T>>>"
+          _chase_hpp "${_chase_hpp}")
+      file(WRITE "${_chase_matrices}" "${_chase_hpp}")
+      message(STATUS "Patched ChASE chase_mpi_matrices.hpp for GCC 14 / C++17 compatibility")
+    endif()
   endif()
   set(_elsi_src_dir "${elsi_interface_SOURCE_DIR}")
 else()
@@ -132,15 +153,6 @@ set(USE_GPU_CUDA ${PYELSI_ENABLE_CUDA} CACHE BOOL "Enable CUDA in ELSI/ELPA" FOR
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 add_subdirectory("${_elsi_src_dir}" elsi_build)
-
-# ChASE (bundled in ELSI v2.11.0) defines chase::mpi::make_unique, which
-# becomes ambiguous with std::make_unique under C++17 / GCC >= 14 because
-# GCC 14 changed std::make_unique's return type to std::__detail::__unique_ptr_t.
-# Compiling ChASE's own translation units in C++14 mode avoids the ambiguity
-# while the rest of pyELSI stays on C++17.
-if(TARGET chase)
-  set_target_properties(chase PROPERTIES CXX_STANDARD 14 CXX_STANDARD_REQUIRED ON)
-endif()
 
 pybind11_add_module(_pyelsi_core
   cpp/pyelsi_module.cpp
