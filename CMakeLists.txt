@@ -29,13 +29,24 @@ if(CMAKE_Fortran_COMPILER_ID STREQUAL "GNU")
   set(CMAKE_Fortran_FLAGS "${CMAKE_Fortran_FLAGS} -fallow-argument-mismatch")
 endif()
 
-# Bundled PEXSI triggers bogus GCC 14 -Wstringop-overflow diagnostics inside libstdc++
-# headers when inlining std::fill; conda compilers may treat warnings as errors.
+# Several bundled third-party libraries (PEXSI, SCOTCH, ELPA) contain code that
+# triggers new-in-GCC-14 hard errors.  Demote them back to warnings so the build
+# succeeds with modern toolchains from conda-forge or system GCC 14+.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   add_compile_options(
+    # PEXSI / libstdc++ headers: bogus -Wstringop-overflow on std::fill
     $<$<COMPILE_LANGUAGE:CXX>:-Wno-stringop-overflow>
     $<$<COMPILE_LANGUAGE:CXX>:-Wno-error=stringop-overflow>
     $<$<COMPILE_LANGUAGE:CXX>:-Wno-deprecated-declarations>
+  )
+endif()
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+  add_compile_options(
+    # SCOTCH (bundled in ELSI/PEXSI) calls waitpid without including <sys/wait.h>.
+    # GCC 14 makes -Wimplicit-function-declaration a hard error; demote it.
+    $<$<COMPILE_LANGUAGE:C>:-Wno-implicit-function-declaration>
+    # Also guard against -Wimplicit-int (same vintage of GCC 14 strictness).
+    $<$<COMPILE_LANGUAGE:C>:-Wno-implicit-int>
   )
 endif()
 
