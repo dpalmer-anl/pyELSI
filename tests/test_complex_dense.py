@@ -39,9 +39,10 @@ def test_eigh_complex_elpa_matches_scipy():
     H = _herm(rng, n).astype(np.complex128)
 
     w_ref, v_ref = scipy.linalg.eigh(H)
-    w, v = pyelsi.eigh(H, solver="elpa")
+    # Request all n eigenpairs so eigenvector comparison covers the full spectrum.
+    w, v = pyelsi.eigh(H, solver="elpa", backend_opts={"n_state": n, "n_electron": float(n)})
 
-    dw = w - w_ref
+    dw = w[:n] - w_ref
     print(
         "\n[pyELSI vs SciPy] complex eigh solver=elpa",
         f"n={n}",
@@ -49,8 +50,8 @@ def test_eigh_complex_elpa_matches_scipy():
         f"mean|dw|={np.mean(np.abs(dw)):.3e}",
     )
 
-    np.testing.assert_allclose(w, w_ref, rtol=1e-9, atol=1e-9)
-    proj = v.conj().T @ v_ref
+    np.testing.assert_allclose(w[:n], w_ref, rtol=1e-9, atol=1e-9)
+    proj = v[:, :n].conj().T @ v_ref
     np.testing.assert_allclose(np.abs(np.diag(proj)), np.ones(n), rtol=1e-7, atol=1e-7)
 
 

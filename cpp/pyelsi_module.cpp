@@ -29,6 +29,19 @@ static py::dict build_info_dict() {
 #else
   d["has_cuda"] = false;
 #endif
+
+#if PYELSI_HAS_CHASE
+  d["has_chase"] = true;
+#else
+  d["has_chase"] = false;
+#endif
+
+#if PYELSI_HAS_SIPS
+  d["has_sips"] = true;
+#else
+  d["has_sips"] = false;
+#endif
+
   d["backend"] = "elsi";
   return d;
 }
@@ -106,8 +119,19 @@ static void apply_options(elsi_handle h, const std::map<std::string, py::object>
   if (auto v = get_double("ntpoly_filter")) c_elsi_set_ntpoly_filter(h, *v);
   if (auto v = get_int("ntpoly_max_iter")) c_elsi_set_ntpoly_max_iter(h, *v);
 
+  // SIPS (SLEPc-SIP) settings
+  if (auto v = get_int("sips_n_elpa"))         c_elsi_set_sips_n_elpa(h, *v);
+  if (auto v = get_int("sips_n_slice"))         c_elsi_set_sips_n_slice(h, *v);
+  if (auto v = get_double("sips_inertia_tol"))  c_elsi_set_sips_inertia_tol(h, *v);
+  if (auto v = get_double("sips_ev_min"))       c_elsi_set_sips_ev_min(h, *v);
+  if (auto v = get_double("sips_ev_max"))       c_elsi_set_sips_ev_max(h, *v);
+
   // ChASE settings
-  if (auto v = get_double("chase_tol")) c_elsi_set_chase_tol(h, *v);
+  if (auto v = get_double("chase_tol"))           c_elsi_set_chase_tol(h, *v);
+  if (auto v = get_int("chase_filter_deg"))        c_elsi_set_chase_filter_deg(h, *v);
+  if (auto v = get_double("chase_extra_space"))    c_elsi_set_chase_extra_space(h, *v);
+  if (auto v = get_int("chase_min_extra_space"))   c_elsi_set_chase_min_extra_space(h, *v);
+  if (auto v = get_int("chase_cholqr"))            c_elsi_set_chase_cholqr(h, *v);
 }
 
 /** ELSI C bindings always c_f_pointer(ovlp); NULL crashes. Provide a dummy buffer when S is omitted. */
@@ -534,6 +558,101 @@ static py::tuple elsi_dm_complex_dense(
   return py::make_tuple(dm, energy.at(0));
 }
 
+/** Sparse (GENERIC_COO) eigenproblem solver — used by SIPS (SLEPc-SIP).
+ *
+ * Computes the n_state lowest eigenvalues/eigenvectors of a sparse symmetric
+ * matrix H (supplied as 1-based COO triplets).  Eigenvectors are returned in
+ * BLACS column-major layout; for a 1×1 grid the array has shape
+ * (n_basis, n_basis) with the first n_state columns populated.
+ */
+static py::tuple elsi_ev_real_coo(
+    py::array_t<double, py::array::c_style | py::array::forcecast> ham_val,
+    py::array_t<int,    py::array::c_style | py::array::forcecast> row_ind_1based,
+    py::array_t<int,    py::array::c_style | py::array::forcecast> col_ind_1based,
+    int n_basis, py::object ovlp_val_obj, int solver,
+    double n_electron, int n_state,
+    py::dict backend_opts, bool want_vectors) {
+
+  maybe_mpi_init();
+
+  if (ham_val.ndim() != 1) throw std::runtime_error("ham_val must be 1D");
+  if (row_ind_1based.ndim() != 1 || col_ind_1based.ndim() != 1)
+    throw std::runtime_error("row/col indices must be 1D");
+  const int nnz = static_cast<int>(ham_val.shape(0));
+  if (row_ind_1based.shape(0) != nnz || col_ind_1based.shape(0) != nnz)
+    throw std::runtime_error("row/col length must equal nnz");
+
+  int world_size_ev = 1;
+  MPI_Comm_size(MPI_COMM_WORLD, &world_size_ev);
+  const bool force_single =
+      world_size_ev > 1 &&
+      ((std::getenv("PYELSI_FORCE_SINGLE_PROC") != nullptr) ||
+       (backend_opts.contains("force_single_proc") &&
+        backend_opts["force_single_proc"].cast<int>() != 0));
+  const MPI_Comm ev_comm = force_single ? MPI_COMM_SELF : MPI_COMM_WORLD;
+
+  // matrix_format=3 (GENERIC_COO), parallel_mode=1 (MULTI_PROC)
+  elsi_handle h = nullptr;
+  c_elsi_init(&h, solver, 1, 3, n_basis, n_electron, n_state);
+
+  c_elsi_set_mpi(h, MPI_Comm_c2f(ev_comm));
+  c_elsi_set_mpi_global(h, MPI_Comm_c2f(MPI_COMM_WORLD));
+  const int ictxt_ev = blacs_ctxt_1x1(ev_comm);
+  c_elsi_set_blacs(h, ictxt_ev, 32);
+
+  c_elsi_set_spin_degeneracy(h, 1.0);
+  c_elsi_set_mu_broaden_scheme(h, 0);
+  c_elsi_set_mu_broaden_width(h, 1.0e-12);
+
+  c_elsi_set_coo(h, nnz, nnz,
+                 row_ind_1based.mutable_data(),
+                 col_ind_1based.mutable_data());
+
+  py::array_t<double, py::array::c_style | py::array::forcecast> ovlp_val;
+  py::array_t<double, py::array::c_style> ovlp_dummy;
+  double* ovlp_ptr = nullptr;
+
+  if (ovlp_val_obj.is_none()) {
+    ovlp_dummy = py::array_t<double, py::array::c_style>({nnz});
+    std::memset(ovlp_dummy.mutable_data(), 0,
+                static_cast<std::size_t>(nnz) * sizeof(double));
+    ovlp_ptr = ovlp_dummy.mutable_data();
+    c_elsi_set_unit_ovlp(h, 1);
+  } else {
+    ovlp_val = ovlp_val_obj.cast<
+        py::array_t<double, py::array::c_style | py::array::forcecast>>();
+    if (ovlp_val.ndim() != 1 || ovlp_val.shape(0) != nnz)
+      throw std::runtime_error("ovlp_val must be 1D of length nnz");
+    ovlp_ptr = ovlp_val.mutable_data();
+    c_elsi_set_unit_ovlp(h, 0);
+  }
+
+  std::map<std::string, py::object> opts;
+  for (auto item : backend_opts) {
+    auto k = py::reinterpret_borrow<py::str>(item.first);
+    auto v = py::reinterpret_borrow<py::object>(item.second);
+    opts[k.cast<std::string>()] = std::move(v);
+  }
+  apply_options(h, opts);
+
+  // Eigenvalues (n_state) and eigenvectors in BLACS layout (n_basis × n_basis).
+  // For a 1×1 grid, n_lrow = n_lcol = n_basis; only the first n_state columns
+  // of evec are populated by ELSI.
+  py::array_t<double> eval({n_state});
+  py::array_t<double, py::array::f_style> evec({n_basis, n_basis});
+
+  double* ev  = static_cast<double*>(eval.mutable_data());
+  double* vec = want_vectors
+                  ? static_cast<double*>(evec.mutable_data())
+                  : static_cast<double*>(evec.mutable_data()); // always alloc
+
+  c_elsi_ev_real_sparse(h, ham_val.mutable_data(), ovlp_ptr, ev, vec);
+  c_elsi_finalize(h);
+
+  if (!want_vectors) return py::make_tuple(eval, py::none());
+  return py::make_tuple(eval, evec);
+}
+
 PYBIND11_MODULE(_pyelsi_core, m) {
   m.doc() = "pyELSI compiled core";
   m.def("build_info", &build_info_dict);
@@ -551,5 +670,8 @@ PYBIND11_MODULE(_pyelsi_core, m) {
   m.def("elsi_dm_real_coo", &elsi_dm_real_coo, py::arg("ham_val"), py::arg("row_ind_1based"), py::arg("col_ind_1based"),
         py::arg("n_basis"), py::arg("ovlp_val"), py::arg("solver"), py::arg("n_electron"), py::arg("n_state"),
         py::arg("backend_opts"));
+  m.def("elsi_ev_real_coo", &elsi_ev_real_coo, py::arg("ham_val"), py::arg("row_ind_1based"), py::arg("col_ind_1based"),
+        py::arg("n_basis"), py::arg("ovlp_val"), py::arg("solver"), py::arg("n_electron"), py::arg("n_state"),
+        py::arg("backend_opts"), py::arg("want_vectors"));
 }
 

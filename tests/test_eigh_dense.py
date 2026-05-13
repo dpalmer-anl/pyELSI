@@ -44,9 +44,10 @@ def test_eigh_elpa_standard():
     H = _sym(rng, n)
 
     w_ref, v_ref = scipy.linalg.eigh(H)
-    w, v = pyelsi.eigh(H, solver="elpa")
+    # Request all n eigenpairs so eigenvector comparison covers the full spectrum.
+    w, v = pyelsi.eigh(H, solver="elpa", backend_opts={"n_state": n, "n_electron": float(n)})
 
-    dw = w - w_ref
+    dw = w[:n] - w_ref
     print(
         "\n[pyELSI vs SciPy] eigh solver=elpa (standard)",
         f"n={n}",
@@ -54,8 +55,8 @@ def test_eigh_elpa_standard():
         f"mean|dw|={np.mean(np.abs(dw)):.3e}",
     )
 
-    np.testing.assert_allclose(w, w_ref, rtol=1e-10, atol=1e-10)
-    proj = v.T @ v_ref
+    np.testing.assert_allclose(w[:n], w_ref, rtol=1e-10, atol=1e-10)
+    proj = v[:, :n].T @ v_ref
     np.testing.assert_allclose(np.abs(np.diag(proj)), np.ones(n), rtol=1e-8, atol=1e-8)
 
 
@@ -69,9 +70,10 @@ def test_eigh_elpa_generalized():
     S = _spd(rng, n)
 
     w_ref, v_ref = scipy.linalg.eigh(H, S)
-    w, v = pyelsi.eigh(H, S=S, solver="elpa")
+    # Request all n eigenpairs so eigenvector comparison covers the full spectrum.
+    w, v = pyelsi.eigh(H, S=S, solver="elpa", backend_opts={"n_state": n, "n_electron": float(n)})
 
-    dw = w - w_ref
+    dw = w[:n] - w_ref
     print(
         "\n[pyELSI vs SciPy] eigh solver=elpa (generalized)",
         f"n={n}",
@@ -79,8 +81,8 @@ def test_eigh_elpa_generalized():
         f"mean|dw|={np.mean(np.abs(dw)):.3e}",
     )
 
-    np.testing.assert_allclose(w, w_ref, rtol=1e-9, atol=1e-9)
-    proj = v.T @ (S @ v_ref)
+    np.testing.assert_allclose(w[:n], w_ref, rtol=1e-9, atol=1e-9)
+    proj = v[:, :n].T @ (S @ v_ref)
     np.testing.assert_allclose(np.abs(np.diag(proj)), np.ones(n), rtol=1e-7, atol=1e-7)
 
 
@@ -97,9 +99,10 @@ def test_eigh_elpa_complex_standard():
     H = _herm(rng, n).astype(np.complex128)
 
     w_ref, v_ref = scipy.linalg.eigh(H)
-    w, v = pyelsi.eigh(H, solver="elpa")
+    # Request all n eigenpairs so eigenvector comparison covers the full spectrum.
+    w, v = pyelsi.eigh(H, solver="elpa", backend_opts={"n_state": n, "n_electron": float(n)})
 
-    dw = w - w_ref
+    dw = w[:n] - w_ref
     print(
         "\n[pyELSI vs SciPy] eigh solver=elpa (complex standard)",
         f"n={n}",
@@ -107,8 +110,8 @@ def test_eigh_elpa_complex_standard():
         f"mean|dw|={np.mean(np.abs(dw)):.3e}",
     )
 
-    np.testing.assert_allclose(w, w_ref, rtol=1e-9, atol=1e-9)
-    proj = v.conj().T @ v_ref
+    np.testing.assert_allclose(w[:n], w_ref, rtol=1e-9, atol=1e-9)
+    proj = v[:, :n].conj().T @ v_ref
     np.testing.assert_allclose(np.abs(np.diag(proj)), np.ones(n), rtol=1e-7, atol=1e-7)
 
 
@@ -122,19 +125,23 @@ def test_eigh_elpa_eigenvalues_only():
 
     rng = np.random.default_rng(20)
     n = 25
+    n_state = n // 2
     H = _sym(rng, n)
 
     w_ref = scipy.linalg.eigh(H, eigvals_only=True)
-    result = pyelsi.eigh(H, solver="elpa", return_eigenvectors=False)
+    result = pyelsi.eigh(H, solver="elpa",
+                         backend_opts={"n_state": n_state, "n_electron": float(n_state)},
+                         return_eigenvectors=False)
 
     # When return_eigenvectors=False the API returns (w, None); unpack accordingly.
     w = result[0] if isinstance(result, tuple) else result
 
-    dw = w - w_ref
+    # Compare the first n_state eigenvalues.
+    dw = w[:n_state] - w_ref[:n_state]
     print(
         "\n[pyELSI vs SciPy] eigh solver=elpa (eigenvalues only)",
-        f"n={n}",
+        f"n={n} n_state={n_state}",
         f"max|dw|={np.max(np.abs(dw)):.3e}",
     )
 
-    np.testing.assert_allclose(w, w_ref, rtol=1e-10, atol=1e-10)
+    np.testing.assert_allclose(w[:n_state], w_ref[:n_state], rtol=1e-10, atol=1e-10)

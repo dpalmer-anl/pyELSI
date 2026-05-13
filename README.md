@@ -9,25 +9,84 @@
 
 ## Solvers
 
-`pyELSI` exposes four solvers through `pyelsi.eigh(...)` and `pyelsi.density_matrix(...)`.
+`pyELSI` exposes solvers through `pyelsi.eigh(...)` and `pyelsi.density_matrix(...)`.
 
-| Solver | Input format | `eigh` | `density_matrix` | MPI |
-|--------|-------------|--------|-----------------|-----|
-| **ELPA**   | Dense real / complex | ✓ | ✓ | ✓ |
-| **libOMM** | Dense real / complex | — | ✓ | ✓ |
-| **PEXSI**  | Sparse real (CSR)   | — | ✓ | ✓ |
-| **NTPoly** | Sparse real (CSR)   | — | ✓ | ✓ |
+| Solver | `solver=` | Input format | `eigh` | `density_matrix` | MPI | Default build |
+|--------|-----------|-------------|--------|-----------------|-----|---------------|
+| **ELPA**      | `"elpa"`   | Dense real / complex | ✓ | ✓    | ✓ | ✓ |
+| **libOMM**    | `"omm"`    | Dense real / complex | — | ✓    | ✓ | ✓ |
+| **PEXSI**     | `"pexsi"`  | Sparse CSR (real)   | — | ✓    | ✓ | ✓ |
+| **NTPoly**    | `"ntpoly"` | Sparse CSR (real)   | — | ✓    | ✓ | ✓ |
+| **ChASE**     | `"chase"`  | Dense real           | ✓ | ⚠ ¹ | ✓ | ✓ |
+| **SLEPc-SIP** | `"sips"`   | Sparse CSR (real)   | ✓ | ✓    | ✓ | opt-in |
+| **MAGMA**     | `"magma"`  | Dense real / complex | ✓ | ✓    | ✓ | opt-in |
+| **DLAF**      | `"dlaf"`   | Dense real / complex | ✓ | ✓    | ✓ | opt-in |
+
+> ¹ **ChASE `density_matrix`**: technically supported via `eigh` internally, but not recommended.
+> ChASE is designed for **extremal eigenpairs** — at most ~20% of the total spectrum.
+> A density matrix requires the lowest `n_electrons ≈ n/2` eigenpairs (50% of the spectrum),
+> which places the spectral cut-off in the middle of the spectrum where the Chebyshev filter has
+> no leverage.  Use ELPA for dense density matrix calculations.
 
 - **ELPA**: Massively parallel dense eigensolver using an efficient two-stage tridiagonalization.
 - **libOMM**: Orbital minimization method — computes the density matrix directly without solving for eigenpairs.
 - **PEXSI**: Fermi operator pole expansion; scales to 100,000+ MPI tasks for sparse Hamiltonians.
 - **NTPoly**: Polynomial expansion of sparse matrix functions; achieves linear scaling for sufficiently sparse inputs.
+- **ChASE**: Chebyshev Accelerated Subspace eigensolver — distributed dense partial-spectrum solver. Best suited for solving for the **lowest ~20% of eigenpairs** (extremal spectrum). Enabled by default.
+- **SLEPc-SIP**: SLEPc shift-and-invert spectral transformation for sparse partial spectra. Requires SLEPc/PETSc; opt-in.
+- **MAGMA**: GPU-accelerated dense eigensolver. Requires CUDA build (`-DPYELSI_ENABLE_CUDA=ON`).
+- **DLAF**: DLA-Future distributed eigensolver. Requires separate DLA-Future library; opt-in.
 
 ## Install
+
+### Python requirements
 
 ```bash
 pip install pyELSI
 ```
+
+Python 3.10+ is required.  Runtime dependencies (`numpy`, `scipy`) are installed
+automatically.  Optional extras:
+
+```bash
+pip install "pyELSI[test,mpi]"   # adds pytest, matplotlib, mpi4py
+```
+
+### Build requirements (source / MPI builds)
+
+Building from source (or enabling MPI/GPU) requires the following system
+libraries.  These are the requirements inherited from ELSI itself:
+
+| Requirement | Version | Notes |
+|-------------|---------|-------|
+| CMake | ≥ 3.6 | Build system |
+| Fortran compiler | Fortran 2003 | e.g. `gfortran ≥ 7` or Intel `ifort` |
+| C compiler | C99 | e.g. `gcc`, `clang`, `icc` |
+| C++ compiler | C++11 | Optional; needed for pybind11 bindings |
+| MPI | MPI-3 | e.g. OpenMPI ≥ 3 or MPICH ≥ 3; required for parallel builds |
+| BLAS / LAPACK | — | e.g. OpenBLAS, MKL, or reference LAPACK |
+| ScaLAPACK | — | Distributed linear algebra; required for MPI builds |
+| CUDA | optional | For MAGMA GPU solver (`-DPYELSI_ENABLE_CUDA=ON`) |
+
+Optional solver dependencies:
+
+| Solver | Extra requirement |
+|--------|------------------|
+| SLEPc-SIP | SLEPc ≥ 3.18 + PETSc ≥ 3.18 (`-DPYELSI_ENABLE_SIPS=ON`) |
+| MAGMA | CUDA toolkit + MAGMA library (`-DPYELSI_ENABLE_CUDA=ON`) |
+| DLAF | DLA-Future library (`-DPYELSI_ENABLE_DLAF=ON`) |
+
+**Conda environment (recommended for development):**
+
+```bash
+conda create -n pyelsi python=3.11 cmake fortran-compiler c-compiler cxx-compiler \
+    openmpi openblas scalapack numpy scipy mpi4py matplotlib pytest
+conda activate pyelsi
+pip install -e ".[test,mpi]" --no-build-isolation
+```
+
+> `--no-build-isolation` is required so that `pip` uses the conda environment's
+> Python headers and MPI libraries rather than an isolated build environment.
 
 ## Usage — serial
 
@@ -138,6 +197,102 @@ D = pyelsi.density_matrix(H, n_electrons=ne, solver="ntpoly")
 print(f"Tr(D) = {D.diagonal().sum():.4f}  (expected {ne})")
 ```
 
+### Sparse density matrix — SLEPc-SIP (SIPS)
+
+When built with SLEPc, SIPS computes the sparse eigenproblem and forms the density matrix.
+
+```python
+import numpy as np
+import scipy.sparse
+import pyelsi
+
+rng = np.random.default_rng(0)
+n, ne = 500, 100
+
+main = rng.standard_normal(n) + n
+off  = 0.1 * rng.standard_normal(n - 1)
+H = scipy.sparse.diags([main, off, off], [0, -1, 1], format="csr")
+
+D = pyelsi.density_matrix(H, n_electrons=ne, solver="sips")
+print(f"Tr(D) = {np.trace(D):.4f}  (expected {ne})")
+```
+
+### Dense partial eigenproblem — ChASE
+
+ChASE computes the `n_state` lowest eigenpairs of a dense symmetric matrix
+using a Chebyshev polynomial filter.  It is most efficient — and most
+reliable — when `n_state` is a **small fraction of `n`** (≤ ~20% of the
+spectrum).  The filter exploits the spectral gap between the last wanted
+eigenvalue and the first unwanted one; that gap is large near the extremes of
+the spectrum and vanishes at the midpoint, so requesting more than ~20% leads
+to slow convergence or incorrect results.
+
+```python
+import numpy as np
+import pyelsi
+
+rng = np.random.default_rng(42)
+n = 200
+n_state = n // 5   # compute lowest 20% of spectrum — ChASE's efficient range
+
+A = rng.standard_normal((n, n))
+H = (A + A.T) / 2 + n * np.eye(n)
+
+w, v = pyelsi.eigh(
+    H, solver="chase",
+    backend_opts={
+        "n_state": n_state,
+        "n_electron": float(n_state),
+        # optional: Chebyshev filter degree (default 25), tolerance (default 1e-10),
+        # and extra subspace fraction 0–0.5 (default 0.25 = 25% extra vectors)
+        "chase_filter_deg": 25,
+        "chase_tol": 1e-10,
+        "chase_extra_space": 0.25,
+    },
+)
+print(f"Lowest eigenvalue: {w[0]:.6f}")
+print(f"Eigenvectors shape: {v.shape}")   # (n, n_state)
+```
+
+### Sparse partial eigenproblem — SLEPc-SIP (SIPS)
+
+SLEPc-SIP solves sparse eigenproblems using a shift-and-invert spectral
+transformation.  It requires the package to be built with
+`-DPYELSI_ENABLE_SIPS=ON` and SLEPc/PETSc installed.
+
+```python
+import numpy as np
+import scipy.sparse
+import pyelsi
+
+rng = np.random.default_rng(0)
+n = 500
+n_state = n // 4   # compute only the lowest quarter of the spectrum
+
+main = rng.standard_normal(n) + n
+off  = 0.1 * rng.standard_normal(n - 1)
+H = scipy.sparse.diags([main, off, off], [0, -1, 1], format="csr")
+
+w, v = pyelsi.eigh(
+    H, solver="sips",
+    backend_opts={
+        "n_state": n_state,
+        "n_electron": float(n_state),
+        # eigenvalue interval is estimated automatically via Gershgorin bounds;
+        # supply explicitly to override:
+        # "sips_ev_min": -10.0,
+        # "sips_ev_max": 100.0,
+    },
+)
+print(f"Lowest eigenvalue: {w[0]:.6f}")
+print(f"Eigenvectors shape: {v.shape}")   # (n, n_state)
+```
+
+> **Enabling SIPS:**  Install SLEPc/PETSc and rebuild:
+> ```bash
+> CMAKE_ARGS="-DPYELSI_ENABLE_SIPS=ON" pip install -v --no-build-isolation .
+> ```
+
 ## Usage — MPI
 
 Under `mpirun` each rank receives `force_single_proc=1` in `backend_opts` so
@@ -182,14 +337,28 @@ mpirun -n 2 python -m pytest tests/test_mpi_smoke.py -v -s
 PYELSI_RUN_SCALING_BENCH=1 mpirun -n 2 python -m pytest tests/test_scaling_benchmark.py -v -s
 ```
 
-## Build options (MPI / CUDA)
+## Build options
 
 ```bash
-# MPI
+# MPI (on by default)
 CMAKE_ARGS="-DPYELSI_ENABLE_MPI=ON" pip install -v .
 
 # CUDA
 CMAKE_ARGS="-DPYELSI_ENABLE_CUDA=ON" pip install -v .
+
+# ChASE (on by default; disable to speed up compilation)
+CMAKE_ARGS="-DPYELSI_ENABLE_CHASE=OFF" pip install -v .
+
+# SLEPc-SIP (off by default; requires SLEPc + PETSc installed)
+CMAKE_ARGS="-DPYELSI_ENABLE_SIPS=ON" pip install -v .
+```
+
+Query which optional solvers are compiled in at runtime:
+
+```python
+import pyelsi
+info = pyelsi.build_info()
+print(info)   # e.g. {'has_mpi': True, 'has_chase': True, 'has_sips': False, ...}
 ```
 
 ## ELSI sources
@@ -249,13 +418,16 @@ PYELSI_RUN_SCALING_BENCH=1 mpirun -n 4 python -m pytest tests/test_scaling_bench
 
 ### Expected complexity (serial)
 
-| Solver | Complexity | Notes |
-|--------|-----------|-------|
-| ELPA `eigh` | O(N³) | Dense two-stage tridiagonalization |
-| ELPA DM | O(N³) | Diagonalization + density-matrix construction |
-| OMM DM | O(N³) | Iterative; first call cold-starts via ELPA |
-| PEXSI DM | O(N^(d/2)) | sparse input; d= dimension of system |
-| NTPoly DM | O(N) | Linear for sufficiently sparse matrices |
+Solvers not compiled in (e.g. SIPS without SLEPc) are silently omitted from the plot.
+
+| Solver | Complexity | Input | Notes |
+|--------|-----------|-------|-------|
+| ELPA DM   | O(N³)      | Dense  | Diagonalization + DM construction |
+| OMM DM    | O(N³)      | Dense  | Iterative; first call bootstraps via ELPA |
+| ChASE eigh| O(N²·k)    | Dense  | k = n\_state (≤ ~20% of N); extremal eigenpairs only |
+| PEXSI DM  | O(N^(d/2)) | Sparse | Pole expansion; d = system dimension |
+| NTPoly DM | O(N)       | Sparse | Linear for sufficiently sparse matrices |
+| SIPS eigh | O(N·k²)    | Sparse | k = n\_state; requires SLEPc |
 
 ![Serial scaling (1 process)](outputs/scaling_nproc_1.png)
 

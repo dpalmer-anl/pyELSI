@@ -7,7 +7,9 @@ import numpy as np
 from ._errors import BackendUnavailableError, InputValidationError
 from ._runtime import detect_runtime
 from ._typing import BackendOpts, UseGpu
-from ._core import _elsi_dm_real_coo, _elsi_dm_real_csc, _elsi_dm_real_dense, _elsi_ev_real_dense
+from ._core import build_info
+from ._core import _elsi_dm_real_coo, _elsi_dm_real_csc, _elsi_dm_real_dense
+from ._core import _elsi_ev_real_dense, _elsi_ev_real_coo
 from ._core import _elsi_dm_complex_dense, _elsi_ev_complex_dense
 
 
@@ -45,8 +47,8 @@ def _as_fortran_c128(a: np.ndarray, name: str) -> np.ndarray:
 
 
 def eigh(
-    H: np.ndarray,
-    S: np.ndarray | None = None,
+    H,
+    S=None,
     *,
     k: int | None = None,
     solver: str = "auto",
@@ -64,25 +66,38 @@ def eigh(
     Parameters
     ----------
     H:
-        Hamiltonian matrix (dense). Must be symmetric.
+        Hamiltonian matrix.  Dense ``numpy.ndarray`` for ELPA/ChASE/OMM;
+        ``scipy.sparse.csr_matrix`` for SIPS (SLEPc-SIP).
     S:
-        Overlap matrix (dense, SPD) for generalized problems.
+        Overlap matrix (same type as H) for generalized problems.
     k:
-        Number of eigenpairs (not yet supported in v0; full spectrum only).
+        Number of eigenpairs (not yet supported; full/partial spectrum via
+        ``backend_opts['n_state']``).
     solver:
-        ELSI solver name (\"auto\", \"lapack\", ...). In v0, \"lapack\" is used.
+        ELSI solver name — ``"elpa"`` (default), ``"chase"``, ``"sips"``,
+        ``"omm"``, ``"ntpoly"``, ``"magma"``, ``"dlaf"``, etc.
     backend_opts:
-        Solver-specific keyword settings (forward-compat with ELSI integration).
+        Solver-specific keyword settings forwarded to ELSI.  Recognized keys
+        include ``n_electron``, ``n_state``, ``chase_tol``,
+        ``chase_filter_deg``, ``chase_extra_space``, ``sips_n_slice``,
+        ``sips_ev_min``, ``sips_ev_max``, ``force_single_proc``, etc.
     n_threads:
         Thread count hint (respects OMP_NUM_THREADS by default).
     use_gpu:
-        \"auto\"/True/False (GPU requires CUDA-enabled build; v0 uses CPU).
+        ``"auto"``/``True``/``False``  (GPU requires CUDA-enabled build).
     mpi_comm:
-        Optional MPI communicator (reserved for MPI-enabled builds; v0 uses serial LAPACK).
+        Optional MPI communicator (reserved; serial BLACS used internally).
     tol, max_iter:
         Reserved for iterative solvers.
     return_eigenvectors:
-        If False, only return eigenvalues.
+        If ``False``, return only eigenvalues.
+
+    Returns
+    -------
+    w : ndarray, shape (n_state,)
+        Eigenvalues in ascending order.
+    v : ndarray, shape (n_basis, n_state)  [only when return_eigenvectors=True]
+        Eigenvectors as columns.
     """
 
     if k is not None:
@@ -97,14 +112,6 @@ def eigh(
     rt = detect_runtime(n_threads=n_threads)
     if use_gpu is True and not rt.has_cuda:
         raise BackendUnavailableError("This pyELSI build does not include CUDA support.")
-
-    is_complex = np.iscomplexobj(H) or (S is not None and np.iscomplexobj(S))
-    if is_complex:
-        Hc = _as_fortran_c128(H, "H")
-        Sc = _as_fortran_c128(S, "S") if S is not None else None
-    else:
-        Hc = _as_fortran_f64(H, "H")
-        Sc = _as_fortran_f64(S, "S") if S is not None else None
 
     solver_map = {
         "elpa": 1,
@@ -123,41 +130,115 @@ def eigh(
             f"solver={solver!r} is not recognized. Supported: {sorted(solver_map.keys())} (or 'auto')."
         )
 
-    # ELSI requires n_electron and n_state at initialization.
-    # If not provided, assume full spectrum solve.
-    n_basis = int(Hc.shape[0])
     if backend_opts is None:
         backend_opts = {}
+    opts = dict(backend_opts)
 
-    n_electron = float(backend_opts.get("n_electron", n_basis // 2))
-    n_state = int(backend_opts.get("n_state", n_basis // 2))
+    n_basis = int(H.shape[0])
+    n_electron = float(opts.get("n_electron", n_basis // 2))
+    n_state = int(opts.get("n_state", n_basis // 2))
+
+    # ------------------------------------------------------------------ SIPS
+    # SLEPc-SIP operates on sparse matrices in COO format.
+    if solver == "sips":
+        if not build_info().get("has_sips", False):
+            raise BackendUnavailableError(
+                "solver='sips' is not available: SLEPc-SIPs was not enabled "
+                "in this ELSI build (PYELSI_ENABLE_SIPS=OFF).  "
+                "Rebuild with -DPYELSI_ENABLE_SIPS=ON after installing SLEPc/PETSc."
+            )
+        if not _is_csr(H):
+            raise InputValidationError("solver='sips' requires H as scipy.sparse.csr_matrix")
+        if S is not None and not _is_csr(S):
+            raise InputValidationError("solver='sips' requires S as scipy.sparse.csr_matrix (or omit S)")
+
+        import scipy.sparse  # type: ignore
+
+        if H.shape[0] != H.shape[1]:
+            raise InputValidationError("H must be square")
+
+        # Estimate eigenvalue interval via Gershgorin circle theorem.
+        if "sips_ev_min" not in opts or "sips_ev_max" not in opts:
+            diag = np.asarray(H.diagonal(), dtype=np.float64)
+            abs_row_sum = np.asarray(np.abs(H).sum(axis=1), dtype=np.float64).ravel()
+            off_diag_sum = abs_row_sum - np.abs(diag)
+            lambda_min = float((diag - off_diag_sum).min())
+            lambda_max = float((diag + off_diag_sum).max())
+            margin = max(0.1 * (lambda_max - lambda_min), 0.5)
+            opts.setdefault("sips_ev_min", lambda_min - margin)
+            opts.setdefault("sips_ev_max", lambda_max + margin)
+
+        opts.setdefault("sips_n_elpa", 3)
+        opts.setdefault("sips_n_slice", max(2 * n_state, 20))
+
+        H_coo = H.tocoo()
+        H_coo.sum_duplicates()
+        ham_val  = np.asarray(H_coo.data, dtype=np.float64)
+        row_ind_1 = np.asarray(H_coo.row,  dtype=np.int32) + 1
+        col_ind_1 = np.asarray(H_coo.col,  dtype=np.int32) + 1
+
+        ovlp_val = None
+        if S is not None:
+            S_coo = S.tocoo()
+            S_coo.sum_duplicates()
+            ovlp_val = np.asarray(S_coo.data, dtype=np.float64)
+
+        w, v_full = _elsi_ev_real_coo(
+            ham_val, row_ind_1, col_ind_1,
+            n_basis, ovlp_val,
+            solver_map["sips"],
+            n_electron, n_state,
+            opts,
+            bool(return_eigenvectors),
+        )
+
+        if return_eigenvectors:
+            # v_full is (n_basis, n_basis) Fortran-order; only first n_state cols valid
+            return w, np.asfortranarray(v_full[:, :n_state])
+        return w
+
+    # ----------------------------------------------------------------- ChASE
+    # Apply default Chebyshev-filter parameters when not overridden.
+    if solver == "chase":
+        if not build_info().get("has_chase", False):
+            raise BackendUnavailableError(
+                "solver='chase' is not available: ChASE was not enabled "
+                "in this ELSI build (PYELSI_ENABLE_CHASE=OFF).  "
+                "Rebuild with -DPYELSI_ENABLE_CHASE=ON."
+            )
+        opts.setdefault("chase_tol", 1e-10)
+        opts.setdefault("chase_filter_deg", 25)
+        opts.setdefault("chase_extra_space", 0.25)  # fraction of n_state (0–0.5)
+
+    # ----------------------------------------------------------------- Dense
+    is_complex = np.iscomplexobj(H) or (S is not None and np.iscomplexobj(S))
+    if is_complex:
+        Hc = _as_fortran_c128(H, "H")
+        Sc = _as_fortran_c128(S, "S") if S is not None else None
+    else:
+        Hc = _as_fortran_f64(H, "H")
+        Sc = _as_fortran_f64(S, "S") if S is not None else None
 
     if is_complex:
         w, v = _elsi_ev_complex_dense(
-            Hc,
-            Sc,
-            solver_map[solver],
-            float(n_electron),
-            int(n_state),
-            dict(backend_opts),
+            Hc, Sc, solver_map[solver],
+            float(n_electron), int(n_state),
+            opts,
             bool(return_eigenvectors),
         )
     else:
         w, v = _elsi_ev_real_dense(
-            Hc,
-            Sc,
-            solver_map[solver],
-            float(n_electron),
-            int(n_state),
-            dict(backend_opts),
+            Hc, Sc, solver_map[solver],
+            float(n_electron), int(n_state),
+            opts,
             bool(return_eigenvectors),
         )
     return (w, v) if return_eigenvectors else w
 
 
 def density_matrix(
-    H: np.ndarray,
-    S: np.ndarray | None = None,
+    H,
+    S=None,
     *,
     n_electrons: int | None = None,
     temperature: float = 0.0,
@@ -170,7 +251,35 @@ def density_matrix(
     tol: float | None = None,
     return_energy: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, float]:
-    """Compute a (zero-temperature) density matrix using an ELSI backend."""
+    """Compute a (zero-temperature) density matrix using an ELSI backend.
+
+    Two computation routes are available:
+
+    **Native ELSI DM solvers** — ELSI internally computes the density matrix
+    without explicitly constructing eigenvectors:
+
+    =========  ===================  ============================
+    solver     Input format         Notes
+    =========  ===================  ============================
+    ``elpa``   Dense real/complex   Default; two-stage diag.
+    ``omm``    Dense real/complex   Orbital minimization method
+    ``pexsi``  Sparse CSR (real)    Pole expansion; linear scale
+    ``ntpoly`` Sparse CSR (real)    Polynomial expansion
+    =========  ===================  ============================
+
+    **Eigenvector-based DM solvers** — pyELSI calls :func:`eigh` then builds
+    ``D = V_occ @ V_occ†`` from the *n_electrons* lowest eigenvectors.
+    The result is always a dense array:
+
+    =========  ===================  ============================
+    solver     Input format         Notes
+    =========  ===================  ============================
+    ``chase``  Dense real           ChASE Chebyshev eigensolver
+    ``sips``   Sparse CSR (real)    SLEPc-SIP (requires SLEPc)
+    ``magma``  Dense real/complex   GPU-accelerated via MAGMA
+    ``dlaf``   Dense real/complex   DLA-Future
+    =========  ===================  ============================
+    """
 
     if temperature != 0.0:
         raise NotImplementedError("Finite temperature is not implemented in v0.")
@@ -182,23 +291,76 @@ def density_matrix(
     if solver == "auto":
         solver = "elpa"
 
-    solver_map = {
+    # Solvers handled by the native ELSI DM API (c_elsi_dm_real / c_elsi_dm_real_sparse).
+    _native_dm_map = {
         "elpa": 1,
         "omm": 2,
         "pexsi": 3,
         "eigenexa": 4,
-        "sips": 5,
         "ntpoly": 6,
     }
 
-    if solver not in solver_map:
+    # Solvers implemented by computing eigenpairs (eigh) then D = V_occ @ V_occ†.
+    _eigh_dm_sparse = {"sips"}          # require sparse CSR input
+    _eigh_dm_dense  = {"chase", "magma", "dlaf"}  # require dense input
+    _eigh_dm_solvers = _eigh_dm_sparse | _eigh_dm_dense
+
+    _all_solvers = set(_native_dm_map) | _eigh_dm_solvers
+    if solver not in _all_solvers:
         raise BackendUnavailableError(
-            f"solver={solver!r} is not recognized for density matrix. Supported: {sorted(solver_map.keys())} (or 'auto')."
+            f"solver={solver!r} is not recognized for density matrix. "
+            f"Supported: {sorted(_all_solvers)} (or 'auto')."
         )
+
+    # Retain solver_map alias for the native path used below.
+    solver_map = _native_dm_map
 
     opts = dict(backend_opts or {})
     opts["n_electron"] = float(n_electrons)
 
+    # ------------------------------------------------------------------
+    # Eigenvector-based DM path: call eigh() then form D = V_occ @ V_occ†
+    # ------------------------------------------------------------------
+    if solver in _eigh_dm_solvers:
+        if solver in _eigh_dm_sparse and not _is_csr(H):
+            raise InputValidationError(
+                f"solver={solver!r} requires H as scipy.sparse.csr_matrix"
+            )
+        if solver in _eigh_dm_dense and _is_csr(H):
+            raise InputValidationError(
+                f"solver={solver!r} requires a dense numpy.ndarray H"
+            )
+
+        n_basis = int(H.shape[0])
+        n_occ   = int(n_electrons)
+        # We need exactly n_occ eigenpairs; allow the caller to request more.
+        n_state = int(opts.get("n_state", n_occ))
+        if n_state < n_occ:
+            raise InputValidationError(
+                f"n_state ({n_state}) must be >= n_electrons ({n_occ}) "
+                "to compute the density matrix from eigenvectors."
+            )
+        opts["n_state"] = n_state
+
+        w, v = eigh(
+            H, S=S,
+            solver=solver,
+            backend_opts=opts,
+            return_eigenvectors=True,
+        )
+
+        v_occ = v[:, :n_occ]
+        if np.iscomplexobj(v_occ):
+            D: np.ndarray = v_occ @ v_occ.conj().T
+        else:
+            D = v_occ @ v_occ.T
+
+        energy = float(np.sum(w[:n_occ]))
+        return (D, energy) if return_energy else D
+
+    # ------------------------------------------------------------------
+    # Native ELSI DM path (ELPA, OMM, PEXSI, EigenExa, NTPoly)
+    # ------------------------------------------------------------------
     if solver in ("pexsi", "ntpoly"):
         if not _is_csr(H):
             raise InputValidationError(f"solver={solver!r} requires H as scipy.sparse.csr_matrix")

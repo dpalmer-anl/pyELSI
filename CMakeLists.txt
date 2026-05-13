@@ -93,8 +93,12 @@ set(ENABLE_C_TESTS OFF CACHE BOOL "Disable ELSI C tests" FORCE)
 set(USE_ELPA_2020 OFF CACHE BOOL "Prefer newer internal ELPA when available" FORCE)
 
 # Enable redistributed solver libraries where possible.
+option(PYELSI_ENABLE_CHASE "Enable ChASE eigensolver" ON)
+option(PYELSI_ENABLE_SIPS  "Enable SLEPc-SIP eigensolver (requires external SLEPc/PETSc)" OFF)
+
 set(ENABLE_PEXSI ON CACHE BOOL "Enable PEXSI in ELSI" FORCE)
-set(ENABLE_CHASE ON CACHE BOOL "Enable ChASE in ELSI" FORCE)
+set(ENABLE_CHASE ${PYELSI_ENABLE_CHASE} CACHE BOOL "Enable ChASE in ELSI" FORCE)
+set(ENABLE_SIPS  ${PYELSI_ENABLE_SIPS}  CACHE BOOL "Enable SLEPc-SIPs in ELSI" FORCE)
 set(ENABLE_BSEPACK ON CACHE BOOL "Enable BSEPACK in ELSI" FORCE)
 set(USE_GPU_CUDA ${PYELSI_ENABLE_CUDA} CACHE BOOL "Enable CUDA in ELSI/ELPA" FORCE)
 
@@ -127,6 +131,18 @@ endif()
 target_link_libraries(_pyelsi_core PRIVATE Threads::Threads MPI::MPI_C)
 
 target_compile_definitions(_pyelsi_core PRIVATE PYELSI_HAS_MPI=1)
+
+if(PYELSI_ENABLE_CHASE)
+  target_compile_definitions(_pyelsi_core PRIVATE PYELSI_HAS_CHASE=1)
+else()
+  target_compile_definitions(_pyelsi_core PRIVATE PYELSI_HAS_CHASE=0)
+endif()
+
+if(PYELSI_ENABLE_SIPS)
+  target_compile_definitions(_pyelsi_core PRIVATE PYELSI_HAS_SIPS=1)
+else()
+  target_compile_definitions(_pyelsi_core PRIVATE PYELSI_HAS_SIPS=0)
+endif()
 
 if(PYELSI_ENABLE_CUDA)
   target_compile_definitions(_pyelsi_core PRIVATE PYELSI_HAS_CUDA=1)
