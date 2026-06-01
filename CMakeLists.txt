@@ -287,13 +287,15 @@ else()
 endif()
 
 if(PYELSI_ENABLE_CUDA)
-  # Explicitly link the CUDA runtime and cuBLAS so they appear in the .so's
-  # NEEDED list.  Without this, the symbols from ELPA's static archive are
-  # unresolved at Python import time even though the libraries exist on disk.
-  # INSTALL_RPATH_USE_LINK_PATH tells CMake to derive the RPATH automatically
-  # from the directories of all linked targets — more reliable than a manual
-  # CMAKE_INSTALL_RPATH entry.
-  target_link_libraries(_pyelsi_core PRIVATE CUDA::cublas CUDA::cudart)
+  # Explicitly link all CUDA libraries used by ELPA/ChASE so they appear in
+  # the .so's NEEDED list.  Without this, symbols from the static ELPA archive
+  # are unresolved at Python import time even though the libraries exist on disk.
+  #   cublas   — dense BLAS on GPU (syrk, trmm, gemm, …)
+  #   cusolver — GPU QR / Cholesky (cusolverDnCgeqrf, …) used by ELPA stage-2
+  #   cudart   — CUDA runtime (cudaMalloc, cudaMemcpy, …)
+  # INSTALL_RPATH_USE_LINK_PATH derives the RPATH from the linked target dirs,
+  # so the .so finds the libraries without requiring module load at runtime.
+  target_link_libraries(_pyelsi_core PRIVATE CUDA::cublas CUDA::cusolver CUDA::cudart)
   set_target_properties(_pyelsi_core PROPERTIES INSTALL_RPATH_USE_LINK_PATH ON)
   target_compile_definitions(_pyelsi_core PRIVATE PYELSI_HAS_CUDA=1)
 else()
