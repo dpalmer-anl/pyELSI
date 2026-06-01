@@ -39,34 +39,22 @@
 
 ## Install
 
-### Python requirements
+pyELSI must be built from source.  Python 3.10+ is required.
 
-```bash
-pip install pyELSI
-```
+### Build requirements
 
-Python 3.10+ is required.  Runtime dependencies (`numpy`, `scipy`) are installed
-automatically.  Optional extras:
-
-```bash
-pip install "pyELSI[test,mpi]"   # adds pytest, matplotlib, mpi4py
-```
-
-### Build requirements (source / MPI builds)
-
-Building from source (or enabling MPI/GPU) requires the following system
-libraries.  These are the requirements inherited from ELSI itself:
+Building from source requires the following system libraries (inherited from ELSI):
 
 | Requirement | Version | Notes |
 |-------------|---------|-------|
-| CMake | ≥ 3.6 | Build system |
-| Fortran compiler | Fortran 2003 | e.g. `gfortran ≥ 7` or Intel `ifort` |
+| CMake | ≥ 3.20 | Build system |
+| Fortran compiler | Fortran 2003 | e.g. `gfortran ≥ 7`, `ifort`, or Cray `ftn` |
 | C compiler | C99 | e.g. `gcc`, `clang`, `icc` |
-| C++ compiler | C++11 | Optional; needed for pybind11 bindings |
-| MPI | MPI-3 | e.g. OpenMPI ≥ 3 or MPICH ≥ 3; required for parallel builds |
-| BLAS / LAPACK | — | e.g. OpenBLAS, MKL, or reference LAPACK |
+| C++ compiler | C++11 | Needed for pybind11 bindings |
+| MPI | MPI-3 | e.g. OpenMPI ≥ 3, MPICH ≥ 3, or Cray MPICH |
+| BLAS / LAPACK | — | e.g. OpenBLAS, MKL, or Cray LibSci |
 | ScaLAPACK | — | Distributed linear algebra; required for MPI builds |
-| CUDA | optional | For MAGMA GPU solver (`-DPYELSI_ENABLE_CUDA=ON`) |
+| CUDA toolkit | optional | For MAGMA / ELPA GPU solver |
 
 Optional solver dependencies:
 
@@ -76,52 +64,50 @@ Optional solver dependencies:
 | MAGMA | CUDA toolkit + MAGMA library (`-DPYELSI_ENABLE_CUDA=ON`) |
 | DLAF | DLA-Future library (`-DPYELSI_ENABLE_DLAF=ON`) |
 
-**Conda environment (recommended for development and cluster installs):**
+### Conda environment (development / workstation)
 
 ```bash
 conda create -n pyelsi python=3.11 cmake fortran-compiler c-compiler cxx-compiler \
     openmpi openblas scalapack numpy scipy mpi4py matplotlib pytest \
     scikit-build-core pybind11
 conda activate pyelsi
-pip install -e ".[test,mpi]" --no-build-isolation
+pip install -e ".[test,mpi]"
 ```
 
-> **Why `--no-build-isolation`?**  Without it, pip creates an isolated build
-> environment with its own Python, which may not find the conda environment's
-> MPI headers and libraries.  With `--no-build-isolation`, pip uses the active
-> conda environment directly — but this means the *build-system dependencies*
-> (`scikit-build-core`, `pybind11`) must already be installed there, hence the
-> extra packages in the `conda create` line above.
+### Slurm cluster — CPU + MPI
 
-> **Stale CMake cache.**  If a previous build attempt failed, the `_skbuild/`
-> directory in the project root may contain an incomplete CMake cache that will
-> cause the same errors to repeat.  Delete it before retrying:
-> ```bash
-> rm -rf _skbuild
-> pip install -e ".[test,mpi]" --no-build-isolation
-> ```
+On clusters that provide BLAS/ScaLAPACK through environment modules (Cray LibSci,
+MKL, etc.), load the relevant modules before building so CMake can find them:
 
-> **HPC clusters — conflicting modules / BLAS.**  On clusters where multiple
-> Python environments are loaded simultaneously (e.g. a PyTorch/CUDA module **and**
-> the pyelsi conda env), CMake can pick up BLAS/LAPACK from the wrong environment
-> — typically an incomplete MKL installation — leading to runtime errors like
-> `Intel MKL FATAL ERROR: Cannot load libmkl_def.so.2`.
->
-> pyELSI's build system automatically defaults to `BLA_VENDOR=OpenBLAS` when
-> building inside a conda environment, and bakes the conda env's `lib/` directory
-> into the module RPATH so runtime loading is correct.  If you still see MKL
-> errors, ensure conflicting modules are unloaded **before** building and running:
+```bash
+# Example: Cray PE cluster (e.g. NCSA Delta)
+module load cray-libsci cray-mpich
+conda activate <your-env>
+pip install -e ".[mpi]"
+```
+
+### Slurm cluster — GPU + MPI
+
+Loading the CUDA module sets `CUDA_HOME` / `CUDA_PATH` in the environment.
+The build backend detects these automatically, so no extra flags are needed:
+
+```bash
+module load cray-libsci cray-mpich cuda
+conda activate <your-env>
+pip install -e ".[gpu,mpi]"
+```
+
+To force-disable GPU even when CUDA tools are present:
+
+```bash
+PYELSI_ENABLE_CUDA=0 pip install -e ".[mpi]"
+```
+
+> **BLAS override.**  The build system detects BLAS in this priority order:
+> Cray LibSci (`CRAY_LIBSCI_PREFIX_DIR`) → OpenBLAS in the active conda env →
+> CMake generic search.  To pin a specific vendor explicitly:
 > ```bash
-> module purge                    # or selectively unload PyTorch / CUDA modules
-> conda activate pyelsi
-> rm -rf _skbuild
-> pip install -e ".[test,mpi]" --no-build-isolation
-> ```
-> If you intentionally want to use MKL (e.g. on an Intel cluster), override the
-> vendor:
-> ```bash
-> pip install -e ".[test,mpi]" --no-build-isolation \
->     --config-settings=cmake.define.BLA_VENDOR=Intel10_64lp
+> pip install -e ".[mpi]" --config-settings=cmake.define.BLA_VENDOR=Intel10_64lp
 > ```
 
 ## Usage — serial
@@ -326,7 +312,7 @@ print(f"Eigenvectors shape: {v.shape}")   # (n, n_state)
 
 > **Enabling SIPS:**  Install SLEPc/PETSc and rebuild:
 > ```bash
-> CMAKE_ARGS="-DPYELSI_ENABLE_SIPS=ON" pip install -v --no-build-isolation .
+> pip install -v ".[mpi]" --config-settings cmake.define.PYELSI_ENABLE_SIPS=ON
 > ```
 
 ## Usage — MPI
@@ -377,16 +363,17 @@ PYELSI_RUN_SCALING_BENCH=1 mpirun -n 2 python -m pytest tests/test_scaling_bench
 
 ```bash
 # MPI (on by default)
-CMAKE_ARGS="-DPYELSI_ENABLE_MPI=ON" pip install -v .
+pip install -v ".[mpi]"
 
-# CUDA
-CMAKE_ARGS="-DPYELSI_ENABLE_CUDA=ON" pip install -v .
+# CUDA (auto-detected from CUDA_HOME / CUDA_PATH / nvcc; or force-enable)
+pip install -v ".[gpu,mpi]"               # auto-detects if 'module load cuda' was run
+PYELSI_ENABLE_CUDA=1 pip install -v ".[gpu,mpi]"  # explicit override
 
 # ChASE (on by default; disable to speed up compilation)
-CMAKE_ARGS="-DPYELSI_ENABLE_CHASE=OFF" pip install -v .
+pip install -v ".[mpi]" --config-settings cmake.define.PYELSI_ENABLE_CHASE=OFF
 
 # SLEPc-SIP (off by default; requires SLEPc + PETSc installed)
-CMAKE_ARGS="-DPYELSI_ENABLE_SIPS=ON" pip install -v .
+pip install -v ".[mpi]" --config-settings cmake.define.PYELSI_ENABLE_SIPS=ON
 ```
 
 Query which optional solvers are compiled in at runtime:
@@ -406,7 +393,7 @@ The build can either:
 Vendored build:
 
 ```bash
-CMAKE_ARGS="-DPYELSI_FETCH_ELSI=OFF" pip install -v .
+pip install -v ".[mpi]" --config-settings cmake.define.PYELSI_FETCH_ELSI=OFF
 ```
 
 Upstream repos:

@@ -57,28 +57,47 @@ find_package(pybind11 CONFIG REQUIRED)
 # --- Threads / BLAS / LAPACK / ScaLAPACK ---
 find_package(Threads REQUIRED)
 
-# ── Conda-environment hardening ──────────────────────────────────────────────
-# On HPC clusters it is common to have multiple conda environments active at
-# once (e.g. the build environment + a PyTorch/CUDA module).  CMake's default
-# BLAS search walks LD_LIBRARY_PATH and can accidentally latch onto an
-# incomplete MKL installation from a foreign environment, causing runtime
-# "undefined symbol" errors.  Two countermeasures are applied when building
-# inside a conda environment:
+# ── BLAS / LAPACK vendor detection ───────────────────────────────────────────
+# Priority (highest to lowest):
+#   1. User-supplied  -DBLA_VENDOR=<name>  (always honoured)
+#   2. Cray LibSci    (when CRAY_LIBSCI_PREFIX_DIR is set by cray-libsci module)
+#   3. OpenBLAS       (only when libopenblas actually exists in the conda env)
+#   4. CMake default  (broad search — finds whatever is on LD_LIBRARY_PATH)
 #
-#   1. BLA_VENDOR=OpenBLAS (default, user-overridable) — instructs FindBLAS to
-#      only accept OpenBLAS, so an MKL found on LD_LIBRARY_PATH is ignored.
-#      Users who intentionally want MKL can override:
-#        pip install ... --config-settings=cmake.define.BLA_VENDOR=Intel10_64lp
-#
-#   2. RPATH — the conda env's lib/ is baked into the .so so that the dynamic
-#      linker resolves runtime dependencies from the correct env regardless of
-#      LD_LIBRARY_PATH at the time the Python module is imported.
-if(DEFINED ENV{CONDA_PREFIX})
-  if(NOT DEFINED CACHE{BLA_VENDOR})
-    set(BLA_VENDOR "OpenBLAS" CACHE STRING
-        "Preferred BLAS vendor (e.g. OpenBLAS, Intel10_64lp, FLAME, Generic). \
-Override with -DBLA_VENDOR=<name> if you want a different BLAS.")
+# The old heuristic "always use OpenBLAS inside any conda env" was too
+# aggressive: it caused build failures on HPC envs (e.g. a PyTorch/CUDA env on
+# a Cray PE cluster) that have no openblas conda package and rely on
+# cray-libsci or MKL for BLAS.
+
+if(NOT DEFINED CACHE{BLA_VENDOR})
+  if(DEFINED ENV{CRAY_LIBSCI_PREFIX_DIR})
+    # Cray PE with cray-libsci loaded: prepend the libsci install tree so
+    # find_package(BLAS) discovers libsci_gnu / libsci_cray automatically.
+    # ScaLAPACK is also in the same tree.
+    list(PREPEND CMAKE_PREFIX_PATH "$ENV{CRAY_LIBSCI_PREFIX_DIR}")
+    message(STATUS "pyELSI: Cray LibSci detected — prepending \
+$ENV{CRAY_LIBSCI_PREFIX_DIR} to CMake search path")
+  elseif(DEFINED ENV{CONDA_PREFIX})
+    # In a conda env: only pin to OpenBLAS when the library is actually there.
+    # Avoids incorrectly forcing OpenBLAS on envs built around MKL or libsci.
+    find_library(_pyelsi_conda_openblas openblas
+      HINTS "$ENV{CONDA_PREFIX}/lib"
+      NO_DEFAULT_PATH)
+    if(_pyelsi_conda_openblas)
+      set(BLA_VENDOR "OpenBLAS" CACHE STRING
+          "BLAS vendor (auto-detected: OpenBLAS in conda env). \
+Override with -DBLA_VENDOR=<name>.")
+      message(STATUS "pyELSI: OpenBLAS found in conda env — defaulting BLA_VENDOR=OpenBLAS")
+    else()
+      message(STATUS "pyELSI: No OpenBLAS in conda env — using generic BLAS search")
+    endif()
   endif()
+endif()
+
+# Bake the conda env's lib/ into the module RPATH when building in conda so
+# that the dynamic linker resolves runtime deps from the correct env regardless
+# of LD_LIBRARY_PATH at import time.
+if(DEFINED ENV{CONDA_PREFIX})
   list(PREPEND CMAKE_INSTALL_RPATH "$ENV{CONDA_PREFIX}/lib")
   set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
 endif()
