@@ -272,6 +272,19 @@ endif()
 
 target_link_libraries(_pyelsi_core PRIVATE Threads::Threads MPI::MPI_C)
 
+# GCC auto-vectorises calls to exp(), log(), sin() etc. into SIMD variants
+# such as _ZGVbN2v_exp (AVX2 2-wide) from glibc's libmvec.  These symbols
+# live in libmvec.so, not libm.so, and must be linked explicitly when
+# bundled static libraries (NTPoly, ELPA) reference them.
+find_library(PYELSI_MVEC_LIB mvec)
+if(PYELSI_MVEC_LIB)
+  target_link_libraries(_pyelsi_core PRIVATE ${PYELSI_MVEC_LIB})
+else()
+  # libmvec is part of glibc on Linux; if find_library misses it, pass the
+  # linker flag directly — it is safe to ignore on systems that lack it.
+  target_link_options(_pyelsi_core PRIVATE -Wl,--as-needed,-lmvec)
+endif()
+
 target_compile_definitions(_pyelsi_core PRIVATE PYELSI_HAS_MPI=1)
 
 if(PYELSI_ENABLE_CHASE)
