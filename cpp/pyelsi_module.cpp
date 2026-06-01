@@ -263,7 +263,8 @@ static py::tuple elsi_ev_real_dense(py::array_t<double, py::array::f_style | py:
     const MPI_Comm comm = force_single_proc ? MPI_COMM_SELF : MPI_COMM_WORLD;
     c_elsi_set_mpi(h, MPI_Comm_c2f(comm));
     c_elsi_set_mpi_global(h, MPI_Comm_c2f(MPI_COMM_WORLD));
-    c_elsi_set_blacs(h, blacs_ctxt_1x1(comm), 32);
+    const int ictxt = blacs_ctxt_1x1(comm);
+    c_elsi_set_blacs(h, ictxt, 32);
     c_elsi_set_spin_degeneracy(h, 1.0);
     c_elsi_set_mu_broaden_scheme(h, 0);
     c_elsi_set_mu_broaden_width(h, 1.0e-12);
@@ -277,6 +278,7 @@ static py::tuple elsi_ev_real_dense(py::array_t<double, py::array::f_style | py:
                    static_cast<double*>(eval.mutable_data()),
                    static_cast<double*>(evec.mutable_data()));
     c_elsi_finalize(h);
+    Cblacs_gridexit(ictxt);
     if (!want_vectors) return py::make_tuple(eval, py::none());
     return py::make_tuple(eval, evec);
   }
@@ -392,7 +394,8 @@ static py::tuple elsi_dm_real_dense(py::array_t<double, py::array::f_style | py:
     const MPI_Comm comm = force_single_proc ? MPI_COMM_SELF : MPI_COMM_WORLD;
     c_elsi_set_mpi(h, MPI_Comm_c2f(comm));
     c_elsi_set_mpi_global(h, MPI_Comm_c2f(MPI_COMM_WORLD));
-    c_elsi_set_blacs(h, blacs_ctxt_1x1(comm), 32);
+    const int ictxt = blacs_ctxt_1x1(comm);
+    c_elsi_set_blacs(h, ictxt, 32);
     c_elsi_set_spin_degeneracy(h, 1.0);
     c_elsi_set_mu_broaden_scheme(h, 0);
     c_elsi_set_mu_broaden_width(h, 1.0e-12);
@@ -404,6 +407,7 @@ static py::tuple elsi_dm_real_dense(py::array_t<double, py::array::f_style | py:
     c_elsi_dm_real(h, static_cast<double*>(H.mutable_data()), ovlp_global,
                    static_cast<double*>(dm.mutable_data()), &energy_val);
     c_elsi_finalize(h);
+    Cblacs_gridexit(ictxt);
     return py::make_tuple(dm, energy_val);
   }
 
@@ -539,6 +543,7 @@ static py::tuple elsi_dm_real_csc(py::array_t<double, py::array::c_style | py::a
   py::array_t<double> energy({1});
   c_elsi_dm_real_sparse(h, ham_val.mutable_data(), ovlp_ptr, dm_val.mutable_data(), energy.mutable_data());
   c_elsi_finalize(h);
+  Cblacs_gridexit(ictxt_csc);
 
   return py::make_tuple(dm_val, energy.at(0));
 }
@@ -597,7 +602,8 @@ static py::tuple elsi_dm_real_coo(py::array_t<double, py::array::c_style | py::a
     c_elsi_init(&h, solver, 1, 3, n_basis, n_electron, n_state);
     c_elsi_set_mpi(h, MPI_Comm_c2f(comm));
     c_elsi_set_mpi_global(h, MPI_Comm_c2f(MPI_COMM_WORLD));
-    c_elsi_set_blacs(h, blacs_ctxt_1x1(comm), 32);
+    const int ictxt = blacs_ctxt_1x1(comm);
+    c_elsi_set_blacs(h, ictxt, 32);
     c_elsi_set_spin_degeneracy(h, 1.0);
     c_elsi_set_mu_broaden_scheme(h, 0);
     c_elsi_set_mu_broaden_width(h, 1.0e-12);
@@ -612,6 +618,7 @@ static py::tuple elsi_dm_real_coo(py::array_t<double, py::array::c_style | py::a
                           const_cast<double*>(ovlp_global),
                           dm_val_out.mutable_data(), &energy_val);
     c_elsi_finalize(h);
+    Cblacs_gridexit(ictxt);
     return py::make_tuple(dm_val_out, energy_val);
   }
 
@@ -669,6 +676,7 @@ static py::tuple elsi_dm_real_coo(py::array_t<double, py::array::c_style | py::a
 
   // Gather: each rank fills its slice of a full zero array, then Allreduce(SUM)
   py::array_t<double, py::array::c_style> dm_val_out({nnz});
+
   double* dm_ptr = dm_val_out.mutable_data();
   std::memset(dm_ptr, 0, static_cast<std::size_t>(nnz) * sizeof(double));
   for (int k = 0; k < local_nnz; ++k)
@@ -749,6 +757,7 @@ static py::tuple elsi_ev_complex_dense(
   }
 
   c_elsi_finalize(h);
+  Cblacs_gridexit(ictxt);
   if (!want_vectors) return py::make_tuple(eval, py::none());
   return py::make_tuple(eval, evec);
 }
@@ -812,6 +821,7 @@ static py::tuple elsi_dm_complex_dense(
   c_elsi_dm_complex(h, reinterpret_cast<double _Complex*>(H.mutable_data()), reinterpret_cast<double _Complex*>(ovlp),
                     reinterpret_cast<double _Complex*>(dm.mutable_data()), energy.mutable_data());
   c_elsi_finalize(h);
+  Cblacs_gridexit(ictxt);
   return py::make_tuple(dm, energy.at(0));
 }
 
@@ -865,6 +875,7 @@ static py::tuple elsi_ev_real_coo(
                  row_ind_1based.mutable_data(),
                  col_ind_1based.mutable_data());
 
+
   py::array_t<double, py::array::c_style | py::array::forcecast> ovlp_val;
   py::array_t<double, py::array::c_style> ovlp_dummy;
   double* ovlp_ptr = nullptr;
@@ -905,6 +916,7 @@ static py::tuple elsi_ev_real_coo(
 
   c_elsi_ev_real_sparse(h, ham_val.mutable_data(), ovlp_ptr, ev, vec);
   c_elsi_finalize(h);
+  Cblacs_gridexit(ictxt_ev);
 
   if (!want_vectors) return py::make_tuple(eval, py::none());
   return py::make_tuple(eval, evec);
