@@ -34,21 +34,27 @@ endif()
 # succeeds with modern toolchains from conda-forge or system GCC 14+.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   add_compile_options(
+    # Valid on all GCC versions we support (GCC 7+):
     # PEXSI / libstdc++ headers: bogus -Wstringop-overflow on std::fill
     $<$<COMPILE_LANGUAGE:CXX>:-Wno-stringop-overflow>
     $<$<COMPILE_LANGUAGE:CXX>:-Wno-error=stringop-overflow>
     $<$<COMPILE_LANGUAGE:CXX>:-Wno-deprecated-declarations>
-    # GCC 14: destructor syntax with template-id is now an error; suppress it.
-    # Affects SuperLU_DIST and some PEXSI internal headers.
-    $<$<COMPILE_LANGUAGE:CXX>:-Wno-error=template-id-cdtor>
-    # GCC 14: narrowing conversions in initialiser lists are hard errors.
+    # Narrowing conversions in initialiser lists (GCC 7+)
     $<$<COMPILE_LANGUAGE:CXX>:-Wno-narrowing>
-    # GCC 14: -Wformat-security promoted to error; PEXSI and SuperLU use
-    # non-literal format strings in diagnostic printf calls.
+    # Non-literal format strings in PEXSI / SuperLU diagnostic calls (GCC 7+)
     $<$<COMPILE_LANGUAGE:CXX>:-Wno-error=format-security>
-    # GCC 15: restrict-qualifier on references is now a hard error.
-    $<$<COMPILE_LANGUAGE:CXX>:-Wno-error=restrict>
   )
+  # GCC 14+ promoted additional warnings to hard errors in C++17 mode.
+  # -Wno-error=X for a warning that doesn't exist in the compiler version is
+  # itself a hard error on GCC, so these flags MUST be guarded by version.
+  if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 14)
+    add_compile_options(
+      # Destructor with template-id syntax (e.g. p->~T<U>()) → hard error GCC 14
+      $<$<COMPILE_LANGUAGE:CXX>:-Wno-error=template-id-cdtor>
+      # restrict-qualifier on a reference type → hard error GCC 15
+      $<$<COMPILE_LANGUAGE:CXX>:-Wno-error=restrict>
+    )
+  endif()
 endif()
 if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
   add_compile_options(
@@ -57,7 +63,7 @@ if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
     $<$<COMPILE_LANGUAGE:C>:-Wno-implicit-function-declaration>
     # Also guard against -Wimplicit-int (same vintage of GCC 14 strictness).
     $<$<COMPILE_LANGUAGE:C>:-Wno-implicit-int>
-    # GCC 14: -Wformat-security as hard error; demote for C too.
+    # Non-literal format strings in C diagnostics (GCC 7+)
     $<$<COMPILE_LANGUAGE:C>:-Wno-error=format-security>
   )
 endif()
