@@ -38,6 +38,16 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     $<$<COMPILE_LANGUAGE:CXX>:-Wno-stringop-overflow>
     $<$<COMPILE_LANGUAGE:CXX>:-Wno-error=stringop-overflow>
     $<$<COMPILE_LANGUAGE:CXX>:-Wno-deprecated-declarations>
+    # GCC 14: destructor syntax with template-id is now an error; suppress it.
+    # Affects SuperLU_DIST and some PEXSI internal headers.
+    $<$<COMPILE_LANGUAGE:CXX>:-Wno-error=template-id-cdtor>
+    # GCC 14: narrowing conversions in initialiser lists are hard errors.
+    $<$<COMPILE_LANGUAGE:CXX>:-Wno-narrowing>
+    # GCC 14: -Wformat-security promoted to error; PEXSI and SuperLU use
+    # non-literal format strings in diagnostic printf calls.
+    $<$<COMPILE_LANGUAGE:CXX>:-Wno-error=format-security>
+    # GCC 15: restrict-qualifier on references is now a hard error.
+    $<$<COMPILE_LANGUAGE:CXX>:-Wno-error=restrict>
   )
 endif()
 if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
@@ -47,6 +57,8 @@ if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
     $<$<COMPILE_LANGUAGE:C>:-Wno-implicit-function-declaration>
     # Also guard against -Wimplicit-int (same vintage of GCC 14 strictness).
     $<$<COMPILE_LANGUAGE:C>:-Wno-implicit-int>
+    # GCC 14: -Wformat-security as hard error; demote for C too.
+    $<$<COMPILE_LANGUAGE:C>:-Wno-error=format-security>
   )
 endif()
 
@@ -172,6 +184,34 @@ elseif(PYELSI_FETCH_ELSI)
   set(_elsi_src_dir "${elsi_interface_SOURCE_DIR}")
 else()
   message(FATAL_ERROR "ELSI source not found. Either vendor into third_party/elsi/elsi-interface or set -DPYELSI_FETCH_ELSI=ON.")
+endif()
+
+# ── ChASE blas_fortran.hpp — FC_GLOBAL fallback ───────────────────────────────
+# ChASE's blas_fortran.hpp uses the FC_GLOBAL(name, NAME) macro from CMake's
+# FortranCInterface module to declare Fortran BLAS functions with correct name
+# mangling.  On Cray PE clusters with mixed compilers (conda GCC for C/C++,
+# Cray ftn for Fortran) the FortranCInterface-generated header is not on the
+# C++ include path, leaving FC_GLOBAL undefined and causing hard compile errors.
+#
+# GNU Fortran's standard mangling is lowercase + trailing underscore, i.e.
+#   FC_GLOBAL(sscal, SSCAL) → sscal_
+# We prepend a guard at the top of the header so it is only applied when the
+# CMake-generated definition is not already present.
+if(PYELSI_ENABLE_CHASE)
+  set(_chase_blas_fortran
+      "${_elsi_src_dir}/external/ChASE/src/ChASE-MPI/blas_fortran.hpp")
+  if(EXISTS "${_chase_blas_fortran}")
+    file(READ "${_chase_blas_fortran}" _blas_hpp)
+    if(NOT _blas_hpp MATCHES "FC_GLOBAL fallback")
+      string(PREPEND _blas_hpp
+"/* FC_GLOBAL fallback for Cray PE / mixed-compiler builds (added by pyELSI) */\n\
+#ifndef FC_GLOBAL\n\
+#  define FC_GLOBAL(name,NAME) name##_\n\
+#endif\n\n")
+      file(WRITE "${_chase_blas_fortran}" "${_blas_hpp}")
+      message(STATUS "Patched ChASE blas_fortran.hpp: added FC_GLOBAL fallback for Cray PE")
+    endif()
+  endif()
 endif()
 
 # --- Build ELSI as a subproject ---
