@@ -139,6 +139,13 @@ endif()
 if(PYELSI_ENABLE_CUDA)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
+  # Bake the CUDA library directory into the extension module's RPATH so that
+  # libcublas, libcudart, etc. are resolved at Python import time without
+  # requiring 'module load cuda' or a manual LD_LIBRARY_PATH export.
+  # CUDAToolkit_LIBRARY_DIR is set by find_package(CUDAToolkit) and points to
+  # the lib64/ directory of the active CUDA installation.
+  list(APPEND CMAKE_INSTALL_RPATH "${CUDAToolkit_LIBRARY_DIR}")
+  set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
 endif()
 
 # --- ELSI ---
