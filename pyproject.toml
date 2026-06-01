@@ -64,12 +64,3 @@ PYELSI_ENABLE_CUDA = "OFF"
 PYELSI_FETCH_ELSI = "ON"
 PYELSI_ELSI_GIT_TAG = "v2.11.0"
 PYELSI_ENABLE_CHASE = "ON"
-
-# CUDA is auto-detected by _pyelsi_build_backend.py (CUDA_HOME / CUDA_PATH /
-# nvcc on PATH) and surfaced via PYELSI_ENABLE_CUDA=1 in the environment.
-# This override picks that up and passes it through to CMake.
-# To force-disable even when CUDA tools are present: PYELSI_ENABLE_CUDA=0
-[[tool.scikit-build.overrides]]
-if.env.PYELSI_ENABLE_CUDA = "1"
-cmake.define.PYELSI_ENABLE_CUDA = "ON"
-
