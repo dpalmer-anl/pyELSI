@@ -22,9 +22,25 @@ def _is_csr(x: Any) -> bool:
         return False
 
 
-def _as_fortran_f64(a: np.ndarray, name: str) -> np.ndarray:
+def _to_numpy(a: Any, name: str) -> np.ndarray:
+    """Return a NumPy array, transparently pulling CuPy arrays back to host memory.
+
+    ELPA/ELSI accept only CPU (host) pointers.  When a CuPy array is supplied
+    pyelsi performs an implicit device→host copy so that the GPU build can still
+    accept GPU-resident input without requiring the caller to do it manually.
+    ELPA's internal GPU path then issues its own host→device transfer.
+    """
+    mod = type(a).__module__ or ""
+    if mod == "cupy" or mod.startswith("cupy."):
+        # cupy.ndarray.get() returns a NumPy array with the same shape/dtype
+        return a.get()
+    return a
+
+
+def _as_fortran_f64(a: Any, name: str) -> np.ndarray:
+    a = _to_numpy(a, name)
     if not isinstance(a, np.ndarray):
-        raise InputValidationError(f"{name} must be a numpy.ndarray")
+        raise InputValidationError(f"{name} must be a numpy.ndarray (or cupy.ndarray)")
     if a.ndim != 2 or a.shape[0] != a.shape[1]:
         raise InputValidationError(f"{name} must be a square 2D array; got shape={a.shape}")
     if a.dtype != np.float64:
@@ -34,9 +50,10 @@ def _as_fortran_f64(a: np.ndarray, name: str) -> np.ndarray:
     return a
 
 
-def _as_fortran_c128(a: np.ndarray, name: str) -> np.ndarray:
+def _as_fortran_c128(a: Any, name: str) -> np.ndarray:
+    a = _to_numpy(a, name)
     if not isinstance(a, np.ndarray):
-        raise InputValidationError(f"{name} must be a numpy.ndarray")
+        raise InputValidationError(f"{name} must be a numpy.ndarray (or cupy.ndarray)")
     if a.ndim != 2 or a.shape[0] != a.shape[1]:
         raise InputValidationError(f"{name} must be a square 2D array; got shape={a.shape}")
     if a.dtype != np.complex128:
@@ -133,6 +150,13 @@ def eigh(
     if backend_opts is None:
         backend_opts = {}
     opts = dict(backend_opts)
+
+    # Transparently accept CuPy arrays for non-sparse inputs; bring to CPU now
+    # so that shape queries and downstream validation all operate on NumPy.
+    if not _is_csr(H):
+        H = _to_numpy(H, "H")
+    if S is not None and not _is_csr(S):
+        S = _to_numpy(S, "S")
 
     n_basis = int(H.shape[0])
     n_electron = float(opts.get("n_electron", n_basis // 2))
