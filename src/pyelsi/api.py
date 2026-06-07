@@ -4,6 +4,7 @@ from typing import Any, Tuple
 
 import numpy as np
 
+from ._array import ArrayBackend, detect_backend, restore, to_host_numpy
 from ._errors import BackendUnavailableError, InputValidationError
 from ._runtime import detect_runtime
 from ._typing import BackendOpts, UseGpu
@@ -22,23 +23,24 @@ def _is_csr(x: Any) -> bool:
         return False
 
 
-def _to_numpy(a: Any, name: str) -> np.ndarray:
-    """Return a NumPy array, transparently pulling CuPy arrays back to host memory.
+def _resolve_use_gpu(use_gpu: UseGpu, backend: ArrayBackend, has_cuda: bool) -> bool:
+    """Decide whether to request GPU execution for this call.
 
-    ELPA/ELSI accept only CPU (host) pointers.  When a CuPy array is supplied
-    pyelsi performs an implicit device→host copy so that the GPU build can still
-    accept GPU-resident input without requiring the caller to do it manually.
-    ELPA's internal GPU path then issues its own host→device transfer.
+    ``True``/``False`` are explicit.  ``"auto"`` follows the input: a
+    GPU-resident array (CuPy/Torch-CUDA) opts into GPU execution, a host array
+    stays on the CPU.  GPU is only ever requested when the build has CUDA.
     """
-    mod = type(a).__module__ or ""
-    if mod == "cupy" or mod.startswith("cupy."):
-        # cupy.ndarray.get() returns a NumPy array with the same shape/dtype
-        return a.get()
-    return a
+    if use_gpu is True:
+        want = True
+    elif use_gpu is False:
+        want = False
+    else:  # "auto"
+        want = backend.is_gpu
+    return want and has_cuda
 
 
 def _as_fortran_f64(a: Any, name: str) -> np.ndarray:
-    a = _to_numpy(a, name)
+    a = to_host_numpy(a)
     if not isinstance(a, np.ndarray):
         raise InputValidationError(f"{name} must be a numpy.ndarray (or cupy.ndarray)")
     if a.ndim != 2 or a.shape[0] != a.shape[1]:
@@ -51,7 +53,7 @@ def _as_fortran_f64(a: Any, name: str) -> np.ndarray:
 
 
 def _as_fortran_c128(a: Any, name: str) -> np.ndarray:
-    a = _to_numpy(a, name)
+    a = to_host_numpy(a)
     if not isinstance(a, np.ndarray):
         raise InputValidationError(f"{name} must be a numpy.ndarray (or cupy.ndarray)")
     if a.ndim != 2 or a.shape[0] != a.shape[1]:
@@ -83,8 +85,12 @@ def eigh(
     Parameters
     ----------
     H:
-        Hamiltonian matrix.  Dense ``numpy.ndarray`` for ELPA/ChASE/OMM;
-        ``scipy.sparse.csr_matrix`` for SIPS (SLEPc-SIP).
+        Hamiltonian matrix.  Dense ``numpy.ndarray``, ``cupy.ndarray``, or
+        ``torch.Tensor`` (CPU or CUDA) for ELPA/ChASE/OMM;
+        ``scipy.sparse.csr_matrix`` for SIPS (SLEPc-SIP).  A GPU-resident array
+        is copied to the host for the ELSI call (ELSI's C API takes host
+        pointers); ELPA's GPU path then diagonalizes on that same GPU, and the
+        results are returned on the input's framework/device.
     S:
         Overlap matrix (same type as H) for generalized problems.
     k:
@@ -101,7 +107,9 @@ def eigh(
     n_threads:
         Thread count hint (respects OMP_NUM_THREADS by default).
     use_gpu:
-        ``"auto"``/``True``/``False``  (GPU requires CUDA-enabled build).
+        ``"auto"``/``True``/``False`` (GPU requires a CUDA-enabled build).
+        ``"auto"`` enables ELPA GPU kernels when H is a GPU-resident array;
+        ``True`` forces them; ``False`` keeps the solve on the CPU.
     mpi_comm:
         Optional MPI communicator (reserved; serial BLACS used internally).
     tol, max_iter:
@@ -111,10 +119,10 @@ def eigh(
 
     Returns
     -------
-    w : ndarray, shape (n_state,)
-        Eigenvalues in ascending order.
-    v : ndarray, shape (n_basis, n_state)  [only when return_eigenvectors=True]
-        Eigenvectors as columns.
+    w : array, shape (n_state,)
+        Eigenvalues in ascending order.  Same framework/device as ``H``.
+    v : array, shape (n_basis, n_state)  [only when return_eigenvectors=True]
+        Eigenvectors as columns.  Same framework/device as ``H``.
     """
 
     if k is not None:
@@ -151,12 +159,22 @@ def eigh(
         backend_opts = {}
     opts = dict(backend_opts)
 
-    # Transparently accept CuPy arrays for non-sparse inputs; bring to CPU now
-    # so that shape queries and downstream validation all operate on NumPy.
+    # Detect the framework/device of the input so dense results can be returned
+    # on the same GPU the caller built H on.  Sparse (CSR) inputs are SciPy/host
+    # objects and are left untouched.
+    out_backend = ArrayBackend("numpy", False, None)
     if not _is_csr(H):
-        H = _to_numpy(H, "H")
+        out_backend = detect_backend(H)
+        H = to_host_numpy(H)
     if S is not None and not _is_csr(S):
-        S = _to_numpy(S, "S")
+        S = to_host_numpy(S)
+
+    # Resolve GPU execution and, for ELPA, request its GPU kernels.  ELSI accepts
+    # only host pointers; ELPA streams the matrix onto `out_backend`'s device for
+    # the actual diagonalization.
+    want_gpu = _resolve_use_gpu(use_gpu, out_backend, rt.has_cuda)
+    if want_gpu and solver == "elpa":
+        opts.setdefault("elpa_gpu", 1)
 
     n_basis = int(H.shape[0])
     n_electron = float(opts.get("n_electron", n_basis // 2))
@@ -243,21 +261,29 @@ def eigh(
         Hc = _as_fortran_f64(H, "H")
         Sc = _as_fortran_f64(S, "S") if S is not None else None
 
-    if is_complex:
-        w, v = _elsi_ev_complex_dense(
-            Hc, Sc, solver_map[solver],
-            float(n_electron), int(n_state),
-            opts,
-            bool(return_eigenvectors),
-        )
-    else:
-        w, v = _elsi_ev_real_dense(
-            Hc, Sc, solver_map[solver],
-            float(n_electron), int(n_state),
-            opts,
-            bool(return_eigenvectors),
-        )
-    return (w, v) if return_eigenvectors else w
+    # Bind the solve to the input array's GPU so ELPA diagonalizes on the same
+    # device the caller built H on; a no-op for host inputs.
+    with out_backend.device_context():
+        if is_complex:
+            w, v = _elsi_ev_complex_dense(
+                Hc, Sc, solver_map[solver],
+                float(n_electron), int(n_state),
+                opts,
+                bool(return_eigenvectors),
+            )
+        else:
+            w, v = _elsi_ev_real_dense(
+                Hc, Sc, solver_map[solver],
+                float(n_electron), int(n_state),
+                opts,
+                bool(return_eigenvectors),
+            )
+
+    # Return results on the same framework/device as the input H.
+    w = restore(w, out_backend)
+    if return_eigenvectors:
+        return w, restore(v, out_backend)
+    return w
 
 
 def density_matrix(
@@ -373,13 +399,15 @@ def density_matrix(
             return_eigenvectors=True,
         )
 
+        # w/v may be NumPy, CuPy, or Torch (matching the input H); keep all
+        # array math on the originating framework so the DM stays on-device.
         v_occ = v[:, :n_occ]
-        if np.iscomplexobj(v_occ):
-            D: np.ndarray = v_occ @ v_occ.conj().T
+        if "complex" in str(getattr(v_occ, "dtype", "")):
+            D = v_occ @ v_occ.conj().T
         else:
             D = v_occ @ v_occ.T
 
-        energy = float(np.sum(w[:n_occ]))
+        energy = float(to_host_numpy(w[:n_occ]).sum())
         return (D, energy) if return_energy else D
 
     # ------------------------------------------------------------------
@@ -495,6 +523,17 @@ def density_matrix(
         D_sparse = scipy.sparse.coo_matrix((dm_val, (row_out, col_out)), shape=(n_basis, n_basis)).tocsr()
         return (D_sparse, float(energy)) if return_energy else D_sparse
 
+    # Accept GPU-resident (CuPy/Torch) H and return the DM on the same device.
+    out_backend = detect_backend(H)
+    H = to_host_numpy(H)
+    if S is not None:
+        S = to_host_numpy(S)
+
+    rt = detect_runtime(n_threads=n_threads)
+    want_gpu = _resolve_use_gpu(use_gpu, out_backend, rt.has_cuda)
+    if want_gpu and solver == "elpa":
+        opts.setdefault("elpa_gpu", 1)
+
     is_complex = np.iscomplexobj(H) or (S is not None and np.iscomplexobj(S))
     if is_complex:
         Hf = _as_fortran_c128(H, "H")
@@ -503,24 +542,26 @@ def density_matrix(
         Hf = _as_fortran_f64(H, "H")
         Sf = _as_fortran_f64(S, "S") if S is not None else None
 
-    if is_complex:
-        D, energy = _elsi_dm_complex_dense(
-            Hf,
-            Sf,
-            solver_map[solver],
-            float(n_electrons),
-            int(opts.get("n_state", min(int(n_electrons), int(Hf.shape[0])))),
-            opts,
-        )
-    else:
-        D, energy = _elsi_dm_real_dense(
-            Hf,
-            Sf,
-            solver_map[solver],
-            float(n_electrons),
-            int(opts.get("n_state", min(int(n_electrons), int(Hf.shape[0])))),
-            opts,
-        )
+    with out_backend.device_context():
+        if is_complex:
+            D, energy = _elsi_dm_complex_dense(
+                Hf,
+                Sf,
+                solver_map[solver],
+                float(n_electrons),
+                int(opts.get("n_state", min(int(n_electrons), int(Hf.shape[0])))),
+                opts,
+            )
+        else:
+            D, energy = _elsi_dm_real_dense(
+                Hf,
+                Sf,
+                solver_map[solver],
+                float(n_electrons),
+                int(opts.get("n_state", min(int(n_electrons), int(Hf.shape[0])))),
+                opts,
+            )
+    D = restore(D, out_backend)
 
     return (D, float(energy)) if return_energy else D
 

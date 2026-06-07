@@ -132,6 +132,42 @@ print(f"Lowest eigenvalue: {w[0]:.6f}")
 w = pyelsi.eigh(H, solver="elpa", return_eigenvectors=False)
 ```
 
+### GPU arrays (CuPy / PyTorch)
+
+If you build the Hamiltonian on a GPU with CuPy or PyTorch, pass it straight to
+`pyelsi.eigh` — no manual host transfer needed. With a CUDA-enabled build,
+ELPA's GPU kernels are enabled automatically (`use_gpu="auto"`) and the
+diagonalization runs on the **same GPU** that holds the matrix. Results are
+returned on the input's framework and device.
+
+```python
+import cupy as cp
+import pyelsi
+
+n = 2000
+A = cp.random.standard_normal((n, n))
+H = (A + A.T) / 2 + n * cp.eye(n)          # lives on GPU 0
+
+w, v = pyelsi.eigh(H, solver="elpa")        # w, v are cupy.ndarray on GPU 0
+assert isinstance(w, cp.ndarray)
+
+# PyTorch works the same way
+import torch
+Ht = torch.randn(n, n, device="cuda", dtype=torch.float64)
+Ht = (Ht + Ht.T) / 2 + n * torch.eye(n, device="cuda", dtype=torch.float64)
+w_t, v_t = pyelsi.eigh(Ht, solver="elpa")   # torch.Tensor on cuda
+```
+
+Notes:
+
+- ELSI's C API accepts host pointers only, so the matrix is copied host→device
+  internally by ELPA; the compute happens on the GPU, the hand-off goes through
+  host memory. This is the standard ELSI/ELPA GPU usage pattern.
+- Pass `use_gpu=False` to force a CPU solve even for GPU input, or `use_gpu=True`
+  to force ELPA GPU kernels for a host array.
+- Eigenvalues/eigenvectors are computed in float64/complex128 and returned in
+  that precision on the originating device.
+
 ### Generalized eigenproblem (ELPA)
 
 ```python
